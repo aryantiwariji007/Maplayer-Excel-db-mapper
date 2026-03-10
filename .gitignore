@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+map_output.json
+map_result.json

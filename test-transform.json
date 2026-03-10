@@ -1,0 +1,17 @@
+{
+    "job_id": "d99bf1f3-1b58-4d26-9277-eff9b2399fa3",
+    "confirmed_mappings": [
+        {
+            "source_column": "Name",
+            "target_key": "full_name",
+            "confidence": 1.0,
+            "requires_review": false
+        },
+        {
+            "source_column": "Company",
+            "target_key": "Company",
+            "confidence": 1.0,
+            "requires_review": false
+        }
+    ]
+}

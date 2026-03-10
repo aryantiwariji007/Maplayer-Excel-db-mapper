@@ -1,0 +1,315 @@
+Build a production-ready REST API service called "MapLayer" — an AI-powered tabular data parsing and column-mapping layer designed to be embedded across multiple SaaS products.
+
+## Core Purpose
+When software products accept user-uploaded CSV/Excel files, the uploaded column structure almost never matches the target database schema. MapLayer resolves this by semantically matching source columns to target schema columns using AI, handling format transforms, and learning from user corrections over time.
+
+---
+
+## Tech Stack
+- Node.js + TypeScript
+- Express.js for the REST API
+- Gemini API for semantic matching
+- SQLite (via better-sqlite3) for schema registry and correction memory storage
+- multer for file upload handling
+- xlsx library for Excel/CSV parsing
+- zod for request/response validation
+
+---
+
+## Data Models
+
+### Target Schema Registry
+Stored in SQLite. Each registered schema belongs to a software product and represents a table/import target.
+
+```typescript
+interface TargetSchema {
+  id: string;                    // UUID
+  product_id: string;            // e.g. "meshbuilder", "maintSecure", "crm-v2"
+  schema_name: string;           // e.g. "asset_import", "contact_list"
+  description: string;           // what this import is for
+  columns: TargetColumn[];
+  created_at: string;
+  updated_at: string;
+}
+
+interface TargetColumn {
+  key: string;                   // internal DB column name, e.g. "first_name"
+  label: string;                 // human label, e.g. "First Name"
+  description: string;           // context e.g. "The contact's given/first name"
+  data_type: "string" | "number" | "date" | "boolean" | "email" | "phone" | "url";
+  required: boolean;
+  format_hint?: string;          // e.g. "ISO 8601", "E.164", "DD/MM/YYYY"
+  examples?: string[];           // e.g. ["John", "Sarah", "Mohammed"]
+  aliases?: string[];            // known common source names e.g. ["fname", "given name"]
+}
+```
+
+### Mapping Result
+Returned per import job:
+
+```typescript
+interface MappingResult {
+  job_id: string;
+  schema_id: string;
+  source_file_name: string;
+  source_columns: string[];
+  mappings: ColumnMapping[];
+  unmapped_source_columns: string[];    // source cols with no confident match
+  missing_required_columns: string[];   // required target cols not found
+  row_count: number;
+  sample_rows: Record<string, string>[]; // first 3 rows for UI preview
+  ambiguities: Ambiguity[];             // columns needing human review
+  status: "ready" | "needs_review" | "incomplete";
+}
+
+interface ColumnMapping {
+  source_column: string;
+  target_key: string;
+  confidence: number;              // 0.0 to 1.0
+  requires_review: boolean;        // true if confidence < 0.75
+  transform?: TransformHint;
+  reasoning?: string;              // AI's explanation, shown in UI on hover
+}
+
+interface TransformHint {
+  type: "date_format" | "phone_format" | "case_transform" | "number_parse" | "split" | "none";
+  from_format?: string;
+  to_format?: string;
+  notes?: string;
+}
+
+interface Ambiguity {
+  source_column: string;
+  candidates: Array<{
+    target_key: string;
+    confidence: number;
+    reasoning: string;
+  }>;
+}
+```
+
+### Correction Memory
+When users manually fix a mapping, store it:
+
+```typescript
+interface CorrectionRecord {
+  id: string;
+  product_id: string;
+  schema_id: string;
+  source_column_name: string;       // normalised to lowercase, trimmed
+  correct_target_key: string;
+  incorrect_target_key?: string;    // what the AI got wrong, if applicable
+  occurrence_count: number;         // increment on repeat
+  created_at: string;
+  last_seen_at: string;
+}
+```
+
+---
+
+## API Endpoints
+
+### Schema Registry
+
+**POST /schemas**
+Register a target schema for a product.
+Request body: TargetSchema (without id/timestamps)
+Response: created TargetSchema with id
+
+**GET /schemas/:product_id**
+List all schemas for a product.
+
+**GET /schemas/:product_id/:schema_name**
+Get a specific schema.
+
+**PUT /schemas/:product_id/:schema_name**
+Update a schema (triggers re-indexing of aliases in memory).
+
+**DELETE /schemas/:product_id/:schema_name**
+Remove a schema.
+
+---
+
+### Import & Mapping
+
+**POST /map**
+Core endpoint. Accepts a multipart form upload.
+
+Form fields:
+- `file`: the CSV or Excel file (required)
+- `product_id`: string (required)
+- `schema_name`: string (required)
+- `options`: JSON string with optional config:
+  ```typescript
+  {
+    confidence_threshold?: number;    // default 0.75 — below this = needs_review
+    max_header_rows?: number;         // default 3 — how many rows to scan for headers
+    sample_row_count?: number;        // default 3 — rows to return in preview
+  }
+  ```
+
+Processing steps (implement in this order):
+1. Parse the uploaded file using xlsx — detect if CSV or Excel
+2. Run multi-row header detection: scan first `max_header_rows` rows, detect if row 1 is a merged/label row and row 2 is the real header
+3. Extract source column names and first N data rows as samples
+4. Load the target schema from SQLite
+5. Load any correction memory records for this product+schema
+6. Build and send a prompt to Claude with: target schema (full JSON), source columns + sample data, correction memory matches, and instructions
+7. Parse Claude's response into MappingResult
+8. Classify result status: "ready" (all required cols mapped, no low-confidence), "needs_review" (some ambiguities or low-confidence), "incomplete" (missing required columns)
+9. Return MappingResult
+
+**POST /map/confirm**
+Called after user reviews and confirms/adjusts mappings in the UI.
+
+Request body:
+```typescript
+{
+  job_id: string;
+  confirmed_mappings: Array<{
+    source_column: string;
+    target_key: string;
+    was_ai_suggestion: boolean;
+    ai_suggested_key?: string;   // include if user overrode AI
+  }>;
+  product_id: string;
+  schema_id: string;
+}
+```
+
+Processing: For each confirmed mapping, upsert a CorrectionRecord. If ai_suggested_key differs from target_key, record the correction with both values and increment occurrence_count if already exists.
+
+Response: `{ success: true, corrections_stored: number }`
+
+**POST /map/transform**
+Apply the confirmed mappings to the full dataset and return cleaned, transformed data ready for DB insertion.
+
+Request body:
+```typescript
+{
+  job_id: string;
+  confirmed_mappings: ColumnMapping[];
+}
+```
+
+Response:
+```typescript
+{
+  rows: Record<string, any>[];    // keyed by target column keys
+  skipped_rows: Array<{
+    row_index: number;
+    reason: string;
+  }>;
+  transform_summary: Record<string, string>;  // target_key -> transform applied
+}
+```
+
+---
+
+## Antigravity Prompt Design
+
+The prompt sent to Antigravity in POST /map should follow this structure:
+
+```
+System: You are a data schema mapping assistant. Your job is to match columns from an uploaded CSV or Excel file to a target database schema. You must return ONLY valid JSON matching the specified output format. Never include markdown, explanation text, or code fences in your response.
+
+User:
+TARGET SCHEMA:
+[full JSON of TargetSchema]
+
+SOURCE FILE COLUMNS (with sample data):
+[JSON array: { column_name, samples: string[] }]
+
+PAST CORRECTIONS (high-confidence learned mappings for this product):
+[JSON array of CorrectionRecord, or "None"]
+
+TASK:
+Match each source column to the most appropriate target schema column.
+For each match return:
+- source_column
+- target_key (or null if no match)
+- confidence (0.0 to 1.0)
+- reasoning (1 sentence)
+- transform (if the data format needs converting)
+
+If a source column could match multiple target columns with similar confidence
+(within 0.15 of each other), flag it as an ambiguity with all candidates listed.
+
+For columns where past corrections exist, weight those matches heavily
+(treat as 0.95 confidence baseline).
+
+Return this exact JSON structure:
+{
+  "mappings": [...],
+  "ambiguities": [...],
+  "unmapped_source_columns": [...],
+  "missing_required_columns": [...]
+}
+```
+
+---
+
+## Multi-row Header Detection Logic
+
+Implement a function `detectHeaders(rows: string[][]): { headerRowIndex: number, dataStartIndex: number }` that:
+
+1. Takes the first `max_header_rows` raw rows
+2. Checks if any row is >80% non-empty strings (candidate header row)
+3. Detects merged cell artifacts — if a row has many blank cells interspersed with long strings, it is likely a label/title row not a header
+4. Returns the index of the most likely true header row and where data begins
+5. If detection is ambiguous, default to row 0 as header and flag in MappingResult metadata
+
+---
+
+## Error Handling
+
+All endpoints should return consistent error shapes:
+```typescript
+{
+  error: string;
+  code: "SCHEMA_NOT_FOUND" | "PARSE_FAILED" | "AI_TIMEOUT" | "INVALID_FILE" | "MAPPING_FAILED" | "VALIDATION_ERROR";
+  details?: any;
+}
+```
+
+Implement retry logic (max 2 retries, 1s delay) for Claude API calls specifically.
+
+---
+
+## Project Structure
+
+```
+maplayer/
+├── src/
+│   ├── index.ts              # Express app setup
+│   ├── routes/
+│   │   ├── schemas.ts
+│   │   └── map.ts
+│   ├── services/
+│   │   ├── fileParser.ts     # xlsx parsing + header detection
+│   │   ├── aiMapper.ts       # Antigravity prompt + response parsing
+│   │   ├── transformer.ts    # apply mappings to full dataset
+│   │   └── corrections.ts    # correction memory CRUD
+│   ├── db/
+│   │   ├── schema.sql        # SQLite table definitions
+│   │   └── client.ts         # better-sqlite3 setup
+│   ├── types/
+│   │   └── index.ts          # all TypeScript interfaces
+│   └── validation/
+│       └── schemas.ts        # zod validators for all endpoints
+├── package.json
+├── tsconfig.json
+└── README.md
+```
+
+---
+
+## README
+
+Include a README with:
+- Setup instructions (npm install, env vars needed: GEMINI_API_KEY, CLAUDE_API_KEY)
+- How to register a schema (example curl)
+- How to call /map with a file (example curl)
+- How the confidence + review flow works
+- How correction memory improves results over time
+- Notes on extending with a PostgreSQL adapter for production
