@@ -65,6 +65,23 @@ export function listSchemas(product_id: string): TargetSchema[] {
     });
 }
 
+export function listAllSchemas(): TargetSchema[] {
+    const schemas = db.prepare(`SELECT * FROM target_schemas`).all() as any[];
+    return schemas.map(schema => {
+        const cols = db.prepare(`SELECT * FROM target_columns WHERE schema_id = ?`).all(schema.id) as any[];
+        return {
+            ...schema,
+            columns: cols.map(c => ({
+                ...c,
+                required: Boolean(c.required),
+                examples: c.examples ? JSON.parse(c.examples) : undefined,
+                aliases: c.aliases ? JSON.parse(c.aliases) : undefined
+            }))
+        };
+    });
+}
+
+
 export function getSchema(product_id: string, schema_name: string): TargetSchema | null {
     const schema = db.prepare(`SELECT * FROM target_schemas WHERE product_id = ? AND schema_name = ?`).get(product_id, schema_name) as any;
     if (!schema) return null;

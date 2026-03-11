@@ -36,6 +36,7 @@ export const ConfirmMappingInputSchema = z.object({
 
 export const TransformInputSchema = z.object({
     job_id: z.string(),
+    auto: z.boolean().optional().default(false),
     confirmed_mappings: z.array(z.object({
         source_column: z.string(),
         target_key: z.string().nullable(),
@@ -48,14 +49,7 @@ export const TransformInputSchema = z.object({
             notes: z.string().optional()
         }).optional(),
         reasoning: z.string().optional()
-    })),
-    // Additional requirement to pass data arrays could be added, or cache the parsed payload.
-    // The map endpoints expect to transform the full dataset based on mappings.
-    // Since we don't store uploaded files, the user might need to re-upload the file or we handle simple JSON matching?
-    // Let's assume the frontend will send the mappings and job_id. Wait, how do we transform the data without the file?
-    // The user prompt implies: POST /map returns mapping, UI resolves -> POST /map/confirm + POST /map/transform
-    // We'll need to know where the data comes from. The easiest is if /map/transform accepts the file again OR the data array.
-    // We'll add data array handling or file upload handling to TransformInputSchema.
+    })).optional(),
 });
 
 // Since /map/transform relies on file content and the spec didn't specify file re-upload,

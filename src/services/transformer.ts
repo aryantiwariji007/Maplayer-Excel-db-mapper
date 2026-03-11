@@ -1,12 +1,24 @@
 import { ColumnMapping, TransformHint } from '../types';
 
 // In-memory job data store (for prototype). In prod, use Redis or S3.
-const jobDataStore = new Map<string, Record<string, string>[]>();
+export interface JobContext {
+    rows: Record<string, string>[];
+    headers: string[];
+    product_id?: string;
+    schema_name?: string;
+    file_name?: string;
+}
 
-export function storeJobData(jobId: string, rows: Record<string, string>[]) {
-    jobDataStore.set(jobId, rows);
+const jobDataStore = new Map<string, JobContext>();
+
+export function storeJobData(jobId: string, context: JobContext) {
+    jobDataStore.set(jobId, context);
     // Auto-expire after 1 hour (prototype)
     setTimeout(() => jobDataStore.delete(jobId), 3600 * 1000);
+}
+
+export function getJobData(jobId: string): JobContext | undefined {
+    return jobDataStore.get(jobId);
 }
 
 export interface TransformResult {
@@ -44,11 +56,12 @@ function applyTransform(value: string, transform?: TransformHint): any {
 }
 
 export function transformDataset(jobId: string, mappings: ColumnMapping[]): TransformResult {
-    const rawData = jobDataStore.get(jobId);
-    if (!rawData) {
+    const context = jobDataStore.get(jobId);
+    if (!context) {
         throw new Error('Data for job not found or expired.');
     }
 
+    const { rows: rawRows } = context;
     const rows: Record<string, any>[] = [];
     const skipped_rows: Array<{ row_index: number; reason: string }> = [];
     const transform_summary: Record<string, string> = {};
@@ -60,7 +73,7 @@ export function transformDataset(jobId: string, mappings: ColumnMapping[]): Tran
         }
     });
 
-    rawData.forEach((rawRow, idx) => {
+    rawRows.forEach((rawRow, idx) => {
         let skip = false;
         let reason = '';
         const transformedRow: Record<string, any> = {};

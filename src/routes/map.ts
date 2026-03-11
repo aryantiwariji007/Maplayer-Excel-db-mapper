@@ -11,6 +11,8 @@ import { MapOptionsSchema, ConfirmMappingInputSchema, TransformInputSchema } fro
 import { MappingResult, MapOptions, ColumnMapping } from '../types';
 import { storeJobData, transformDataset } from '../services/transformer';
 import { normalizeColumnName } from '../utils/normalize';
+import { performAutoMapping } from '../services/autoMapper';
+import { getJobData } from '../services/transformer';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -142,11 +144,17 @@ router.post('/', upload.any(), async (req: Request, res: Response): Promise<void
 
         // ── Step 10: Store full data and return Mapping Result ───────────────────
         const jobId = uuidv4();
-        storeJobData(jobId, parsed.dataRows.map(rawRow => {
-            const obj: Record<string, string> = {};
-            parsed.headerRow.forEach((col, idx) => obj[col] = String(rawRow[idx] || ""));
-            return obj;
-        }));
+        storeJobData(jobId, {
+            rows: parsed.dataRows.map(rawRow => {
+                const obj: Record<string, string> = {};
+                parsed.headerRow.forEach((col, idx) => obj[col] = String(rawRow[idx] || ""));
+                return obj;
+            }),
+            headers: parsed.headerRow,
+            product_id,
+            schema_name,
+            file_name: file.originalname
+        });
 
         const mappingResult: MappingResult = {
             job_id: jobId,
@@ -195,14 +203,110 @@ router.post('/confirm', (req: Request, res: Response) => {
 });
 
 // POST /map/transform
-router.post('/transform', (req: Request, res: Response) => {
+router.post('/transform', async (req: Request, res: Response): Promise<void> => {
     try {
         const data = TransformInputSchema.parse(req.body);
-        const result = transformDataset(data.job_id, data.confirmed_mappings);
+        
+        let mappings: any = data.confirmed_mappings;
+
+        if (data.auto || !mappings) {
+            const context = getJobData(data.job_id);
+            if (!context) {
+                res.status(404).json({ error: "Job context not found or expired", code: "JOB_EXPIRED" });
+                return;
+            }
+
+            if (!context.product_id || !context.schema_name) {
+                res.status(400).json({ error: "Job missing product or schema context for auto-mapping", code: "CONTEXT_MISSING" });
+                return;
+            }
+
+            const schema = getSchema(context.product_id, context.schema_name);
+            if (!schema) {
+                res.status(404).json({ error: "Schema not found", code: "SCHEMA_NOT_FOUND" });
+                return;
+            }
+
+            const profiles = profileColumns(context.headers, context.rows.map(r => Object.values(r)), normalizeColumnName, 5);
+            mappings = await performAutoMapping(schema, profiles);
+        }
+
+        const result = transformDataset(data.job_id, mappings);
         res.json(result);
     } catch (error: any) {
         const code = error.message?.includes('not found') ? "MAPPING_FAILED" : "VALIDATION_ERROR";
         res.status(code === "MAPPING_FAILED" ? 404 : 400).json({ error: error.message, code });
+    }
+});
+
+// POST /map/auto-transform (One-shot file to JSON)
+router.post('/auto-transform', upload.any(), async (req: Request, res: Response): Promise<void> => {
+    try {
+        const files = req.files as Express.Multer.File[];
+        if (!files || files.length === 0) {
+            res.status(400).json({ error: "No file uploaded", code: "INVALID_FILE" });
+            return;
+        }
+
+        const file = files.find(f => f.fieldname?.toLowerCase() === 'file') || files[0];
+        const { product_id, schema_name } = req.body;
+
+        if (!product_id) {
+            res.status(400).json({ error: "Missing product_id", code: "VALIDATION_ERROR" });
+            return;
+        }
+
+        const parsed = parseFileBuffer(file.buffer);
+        const profiles = profileColumns(parsed.headerRow, parsed.dataRows, normalizeColumnName, 5);
+
+        let targetSchema;
+        if (schema_name) {
+            targetSchema = getSchema(product_id, schema_name);
+        } else {
+            const schemas = listSchemas(product_id);
+            const detection = detectBestSchema(profiles, schemas);
+            if (detection.best_schema) {
+                targetSchema = schemas.find(s => s.schema_name === detection.best_schema);
+            }
+        }
+
+        if (!targetSchema) {
+            res.status(404).json({ error: "Could not identify or find target schema", code: "SCHEMA_NOT_FOUND" });
+            return;
+        }
+
+        const mappings = await performAutoMapping(targetSchema, profiles);
+        
+        // Use transformDataset logic but without job_id (or create a temp one)
+        const jobId = uuidv4();
+        storeJobData(jobId, {
+            rows: parsed.dataRows.map(rawRow => {
+                const obj: Record<string, string> = {};
+                parsed.headerRow.forEach((col, idx) => obj[col] = String(rawRow[idx] || ""));
+                return obj;
+            }),
+            headers: parsed.headerRow,
+            product_id,
+            schema_name: targetSchema.schema_name
+        });
+
+        const result = transformDataset(jobId, mappings);
+        
+        const formattedMappings = mappings.map(m => ({
+            column: m.source_column,
+            mapped_to: m.target_key,
+            confidence: m.confidence
+        }));
+
+        res.json({
+            ...result,
+            detected_schema: targetSchema.schema_name,
+            mappings_applied: mappings.length,
+            mappings: formattedMappings
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ error: error.message, code: "TRANSFORM_FAILED" });
     }
 });
 
@@ -252,11 +356,17 @@ router.post('/detect-schema', upload.any(), async (req: Request, res: Response):
         let jobId = null;
         if (detectionResult.best_schema) {
             jobId = uuidv4();
-            storeJobData(jobId, parsed.dataRows.map(rawRow => {
-                const obj: Record<string, string> = {};
-                parsed.headerRow.forEach((col, idx) => obj[col] = String(rawRow[idx] || ""));
-                return obj;
-            }));
+            storeJobData(jobId, {
+                rows: parsed.dataRows.map(rawRow => {
+                    const obj: Record<string, string> = {};
+                    parsed.headerRow.forEach((col, idx) => obj[col] = String(rawRow[idx] || ""));
+                    return obj;
+                }),
+                headers: parsed.headerRow,
+                product_id,
+                schema_name: detectionResult.best_schema,
+                file_name: file.originalname
+            });
         }
 
         res.json({

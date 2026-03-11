@@ -7,9 +7,19 @@ import { initDb } from './db/client';
 
 import schemasRouter from './routes/schemas';
 import mapRouter from './routes/map';
+import { initQdrant, syncSchemaEmbeddings } from './services/qdrantClient';
+import { listAllSchemas } from './services/corrections';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Initialize Qdrant and sync schemas
+initQdrant().then(() => {
+    const schemas = listAllSchemas();
+    for (const schema of schemas) {
+        syncSchemaEmbeddings(schema).catch(e => console.error("Sync error:", e));
+    }
+});
 
 // Middleware
 app.use(cors());
