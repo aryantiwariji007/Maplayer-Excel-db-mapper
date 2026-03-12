@@ -83,7 +83,7 @@ def process_mapping_for_schema(db: Session, schema: TargetSchema, df: pd.DataFra
 @router.post("/")
 async def map_upload(
     product_id: str = Form(...),
-    schema_name: Optional[str] = Form(None),
+    schema_name: Optional[str] = Form(default=None, description="Provide a schema name to map to specifically, or leave blank to auto-detect."),
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
@@ -187,7 +187,7 @@ async def detect_schema(
 @router.post("/auto-transform")
 async def auto_transform(
     product_id: str = Form(...),
-    schema_name: Optional[str] = Form(None),
+    schema_name: Optional[str] = Form(default=None, description="Provide a schema name to map to specifically, or leave blank to auto-detect."),
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
@@ -238,13 +238,13 @@ async def auto_transform(
     for idx, row in df.iterrows():
         new_row = {}
         for target, source in target_to_source.items():
-            new_row[target] = row.get(source)
-        transformed_data.append(new_row)
+            val = row.get(source)
+            new_row[target] = None if pd.isna(val) else val
+            
+        if new_row:
+            transformed_data.append(new_row)
 
-    # Handle NaN to None for JSON compliance
-    clean_data = [{k: (None if pd.isna(v) else v) for k, v in r.items()} for r in transformed_data]
-
-    return {"transformed_rows": clean_data}
+    return {"transformed_rows": transformed_data}
 
 @router.post("/transform")
 async def manual_transform(
@@ -272,10 +272,9 @@ async def manual_transform(
             source = m.get("source")
             target = m.get("target")
             if source and target:
-                new_row[target] = row.get(source)
-        transformed_data.append(new_row)
+                val = row.get(source)
+                new_row[target] = None if pd.isna(val) else val
+        if new_row:
+            transformed_data.append(new_row)
         
-    # Handle NaN to None for JSON compliance
-    clean_data = [{k: (None if pd.isna(v) else v) for k, v in r.items()} for r in transformed_data]
-
-    return {"transformed_rows": clean_data}
+    return {"transformed_rows": transformed_data}
