@@ -1,0 +1,78 @@
+import uuid
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from ..database import get_db
+from ..models import TargetSchema, TargetColumn
+from ..schemas import TargetSchemaCreate, TargetSchemaResponse
+from ..services.qdrant_service import sync_schema_embeddings
+
+router = APIRouter()
+
+from typing import Optional
+
+@router.get("/", response_model=list[TargetSchemaResponse])
+def list_schemas(product_id: Optional[str] = None, db: Session = Depends(get_db)):
+    stmt = select(TargetSchema)
+    if product_id:
+        stmt = stmt.where(TargetSchema.product_id == product_id)
+    
+    result = db.execute(stmt)
+    schemas = result.scalars().unique().all()
+    return schemas
+
+@router.post("/", response_model=TargetSchemaResponse)
+def create_schema(schema: TargetSchemaCreate, db: Session = Depends(get_db)):
+    # Check if exists
+    result = db.execute(
+        select(TargetSchema).where(
+            TargetSchema.product_id == schema.product_id,
+            TargetSchema.schema_name == schema.schema_name
+        )
+    )
+    existing = result.scalars().first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Schema already exists for this product")
+
+    db_schema = TargetSchema(
+        id=str(uuid.uuid4()),
+        product_id=schema.product_id,
+        schema_name=schema.schema_name,
+        description=schema.description
+    )
+    
+    for col in schema.columns:
+        db_col = TargetColumn(
+            key=col.key,
+            label=col.label,
+            description=col.description,
+            data_type=col.data_type,
+            required=col.required,
+            format_hint=col.format_hint,
+            examples=col.examples,
+            aliases=col.aliases
+        )
+        db_schema.columns.append(db_col)
+        
+    db.add(db_schema)
+    db.commit()
+    db.refresh(db_schema)
+    
+    # Sync with Qdrant
+    try:
+        sync_schema_embeddings(db_schema.id, db_schema.columns)
+    except Exception as e:
+        print(f"Warning: Failed to sync embeddings immediately: {e}")
+
+    return db_schema
+
+@router.delete("/{schema_id}")
+def delete_schema(schema_id: str, db: Session = Depends(get_db)):
+    result = db.execute(select(TargetSchema).where(TargetSchema.id == schema_id))
+    schema = result.scalars().first()
+    if not schema:
+        raise HTTPException(status_code=404, detail="Schema not found")
+        
+    db.delete(schema)
+    db.commit()
+    return {"message": "Schema deleted successfully"}

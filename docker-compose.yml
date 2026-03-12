@@ -11,6 +11,22 @@ services:
       - ./qdrant_storage:/qdrant/storage:z
     restart: always
 
+  postgres:
+    image: postgres:15
+    container_name: maplayer-postgres
+    environment:
+      POSTGRES_USER: maplayer
+      POSTGRES_PASSWORD: maplayer_password
+      POSTGRES_DB: maplayer_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+volumes:
+  postgres_data:
+
 networks:
   default:
     name: maplayer-network
