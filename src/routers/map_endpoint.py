@@ -15,7 +15,7 @@ from ..services.corrections import (
     get_corrections_for_schema,
     record_correction,
 )
-from ..services.data_processor import parse_file
+from ..services.data_processor import parse_file, load_dataframe
 from ..services.mapper import evaluate_best_match, score_mapping
 from ..services.profiler import profile_column
 
@@ -89,10 +89,12 @@ async def map_upload(
 ):
     """Maps an uploaded file to a specific schema (or detects best) and returns mappings."""
     content = await file.read()
-    if file.filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content))
-    else:
-        df = pd.read_excel(io.BytesIO(content))
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    try:
+        df = load_dataframe(content, file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
 
     target_schema = None
     if schema_name:
@@ -150,6 +152,43 @@ def map_confirm(req: CorrectionRequest, db: Session = Depends(get_db)):
 
     return {"message": "Correction recorded successfully", "record_id": record.id}
 
+@router.post("/transform")
+async def manual_transform(
+    file: UploadFile = File(...),
+    mappings_json: str = Form(...),
+):
+    """Takes user confirmed mappings and returns a transformed dataset."""
+    try:
+        confirmed_mappings = json.loads(mappings_json)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid mappings_json provided")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    try:
+        df = load_dataframe(content, file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
+
+    transformed_data = []
+    
+    # Expect confirmed_mappings to be [{"source": "A", "target": "target_A"}]
+    records = df.to_dict(orient="records")
+    for row in records:
+        new_row = {}
+        for m in confirmed_mappings:
+            source = m.get("source")
+            target = m.get("target")
+            if source and target:
+                # Strip source name just in case it was passed with whitespace
+                val = row.get(str(source).strip())
+                new_row[target] = None if pd.isna(val) else val
+        if new_row:
+            transformed_data.append(new_row)
+        
+    return {"transformed_rows": transformed_data}
+
 @router.post("/detect-schema")
 async def detect_schema(
     product_id: str = Form(...),
@@ -162,10 +201,12 @@ async def detect_schema(
         raise HTTPException(status_code=404, detail="No schemas found for product")
 
     content = await file.read()
-    if file.filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content))
-    else:
-        df = pd.read_excel(io.BytesIO(content))
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    try:
+        df = load_dataframe(content, file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
 
     best_schema = None
     best_score = -1
@@ -181,6 +222,8 @@ async def detect_schema(
     return {
         "detected_schema": best_schema.schema_name if best_schema else None,
         "confidence": best_score,
+        "row_count": len(df),
+        "headers": df.columns.tolist(),
         "mappings": best_mappings
     }
 
@@ -193,12 +236,16 @@ async def auto_transform(
 ):
     """Maps the file (auto-detecting schema if not provided) and returns a transformed dataset."""
     content = await file.read()
-    if file.filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content))
-    else:
-        df = pd.read_excel(io.BytesIO(content))
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    try:
+        df = load_dataframe(content, file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
 
     target_schema = None
+    mappings = None
+
     if schema_name:
         target_schema = db.execute(select(TargetSchema).where(
             TargetSchema.product_id == product_id,
@@ -207,6 +254,8 @@ async def auto_transform(
         
         if not target_schema:
             raise HTTPException(status_code=404, detail=f"Schema '{schema_name}' not found")
+        
+        mappings, _ = process_mapping_for_schema(db, target_schema, df)
     else:
         # Auto-detect schema
         schemas = db.execute(select(TargetSchema).where(TargetSchema.product_id == product_id)).scalars().all()
@@ -214,67 +263,53 @@ async def auto_transform(
             raise HTTPException(status_code=404, detail="No schemas found for product")
 
         best_score = -1
+        best_mappings = None
+        
         for s in schemas:
-            _, avg_confidence = process_mapping_for_schema(db, s, df)
+            m, avg_confidence = process_mapping_for_schema(db, s, df)
             if avg_confidence > best_score:
                 best_score = avg_confidence
                 target_schema = s
+                best_mappings = m
         
         if not target_schema:
             raise HTTPException(status_code=404, detail="Could not detect schema automatically")
+        
+        mappings = best_mappings
 
-    mappings, _ = process_mapping_for_schema(db, target_schema, df)
-    
-    # Apply mappings
-    transformed_data = []
-    
     # Create an inverse map: Map target_key -> col name
+    # We take all mappings that have a target key (even if they need review)
     target_to_source = {
         m["mapped_to"]: m["column"]
         for m in mappings
         if m.get("mapped_to") is not None
     }
     
-    for idx, row in df.iterrows():
+    if not target_to_source:
+        return {"transformed_rows": [], "message": "No columns could be mapped to the target schema."}
+
+    # Apply mappings
+    transformed_data = []
+    
+    # Use to_dict for cleaner iteration
+    records = df.to_dict(orient="records")
+    for row in records:
         new_row = {}
         for target, source in target_to_source.items():
             val = row.get(source)
+            # Handle NaN/None
             new_row[target] = None if pd.isna(val) else val
             
-        if new_row:
-            transformed_data.append(new_row)
+        transformed_data.append(new_row)
 
-    return {"transformed_rows": transformed_data}
-
-@router.post("/transform")
-async def manual_transform(
-    file: UploadFile = File(...),
-    mappings_json: str = Form(...),
-):
-    """Takes user confirmed mappings and returns a transformed dataset."""
-    try:
-        confirmed_mappings = json.loads(mappings_json)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Invalid mappings_json provided")
-
-    content = await file.read()
-    if file.filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content))
-    else:
-        df = pd.read_excel(io.BytesIO(content))
-        
-    transformed_data = []
-    
-    # Expect confirmed_mappings to be [{"source": "A", "target": "target_A"}]
-    for idx, row in df.iterrows():
-        new_row = {}
-        for m in confirmed_mappings:
-            source = m.get("source")
-            target = m.get("target")
-            if source and target:
-                val = row.get(source)
-                new_row[target] = None if pd.isna(val) else val
-        if new_row:
-            transformed_data.append(new_row)
-        
-    return {"transformed_rows": transformed_data}
+    return {
+        "detected_schema": target_schema.schema_name,
+        "input_filename": file.filename,
+        "row_count": len(df),
+        "df_empty": df.empty,
+        "headers_detected": df.columns.tolist(),
+        "mappings_used": len(target_to_source),
+        "target_to_source_map": target_to_source,
+        "sample_input_records": records[:2] if records else [],
+        "transformed_rows": transformed_data
+    }
