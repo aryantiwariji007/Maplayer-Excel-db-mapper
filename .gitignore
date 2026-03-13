@@ -7,3 +7,22 @@ dist
 *.db-journal
 map_output.json
 map_result.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Local storage
+qdrant_storage/
+similarity_indices/
+
+# IDE
+.cursor/
+.vscode/
+
+# Testing
+.pytest_cache/
+testing/
+export_data.csv
+sample_feature.csv
