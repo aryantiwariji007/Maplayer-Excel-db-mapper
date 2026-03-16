@@ -49,15 +49,42 @@ def insert_dataset_rows(
     df_insert = df_insert[[col for col in valid_cols if col in df_insert.columns]]
 
     # Replace NaN with None (psycopg2 handles None as NULL)
+    # We do this AFTER renaming but BEFORE type-specific processing
     df_insert = df_insert.where(pd.notna(df_insert), None)
 
-    # Explicitly cast boolean columns to handle string/int inputs
+    # ── Explicit Type Casting ─────────────────────────────────────────────
+    # This prevents failures when pandas infers a loose type (like object or float64)
+    # but the database table has a strict type (like BIGINT).
     for col in columns:
-        if col["data_type"] == "boolean" and col["normalized_name"] in df_insert.columns:
-            # Map common truthy/falsy values to actual booleans
-            df_insert[col["normalized_name"]] = df_insert[col["normalized_name"]].apply(
+        col_name = col["normalized_name"]
+        if col_name not in df_insert.columns:
+            continue
+            
+        dtype = col["data_type"]
+        
+        if dtype == "boolean":
+            df_insert[col_name] = df_insert[col_name].apply(
                 lambda x: str(x).lower() in ("true", "yes", "y", "1", "t") if x is not None else None
             )
+        elif dtype == "integer":
+            # Convert to numeric first, then to nullable Int64 (pandas) or None
+            # Using Series.map() to ensure we keep None as NULL
+            def cast_int(v):
+                if v is None: return None
+                try: return int(float(v))
+                except: return None
+            df_insert[col_name] = df_insert[col_name].map(cast_int)
+        elif dtype == "float":
+            def cast_float(v):
+                if v is None: return None
+                try: return float(v)
+                except: return None
+            df_insert[col_name] = df_insert[col_name].map(cast_float)
+        elif dtype == "timestamp":
+            # Ensure col is datetime object
+            df_insert[col_name] = pd.to_datetime(df_insert[col_name], errors="coerce")
+            # Convert NaT back to None for SQL
+            df_insert[col_name] = df_insert[col_name].where(df_insert[col_name].notnull(), None)
 
     # Use pandas to_sql with method='multi' for batch inserts
     df_insert.to_sql(

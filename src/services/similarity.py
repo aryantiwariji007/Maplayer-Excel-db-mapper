@@ -72,15 +72,31 @@ def score_dataset_similarity(dataset_a: dict, dataset_b: dict) -> float:
     return 0.40 * name_score + 0.30 * type_score + 0.30 * sem_score
 
 
+def get_logical_schema_columns(db: Session, logical_dataset_id: str) -> list[str]:
+    """Retrieves all unique target column names currently in the logical dataset."""
+    from ..models import LogicalDatasetMapping
+    mappings = db.execute(
+        select(LogicalDatasetMapping).where(LogicalDatasetMapping.logical_dataset_id == logical_dataset_id)
+    ).scalars().all()
+    
+    unique_target_cols = set()
+    for m in mappings:
+        for target_col in m.column_mapping.values():
+            unique_target_cols.add(target_col)
+    
+    return list(unique_target_cols)
+
+
 def suggest_logical_dataset(
     db: Session,
     new_dataset_columns: list[dict],
     product_id: str,
-    threshold: float = 0.60,
+    threshold: float = 0.50,
+    sample_data: list[dict] = None
 ) -> list[dict]:
     """
-    Find existing LogicalDatasets for a product whose member datasets are similar
-    to the new dataset. Returns ranked suggestions above the threshold.
+    Find existing LogicalDatasets for a product whose member datasets (or name/desc)
+    are similar to the new dataset. Returns ranked suggestions.
     """
     from ..models import LogicalDataset, LogicalDatasetMapping, Dataset, DatasetColumn
 
@@ -91,28 +107,54 @@ def suggest_logical_dataset(
 
     suggestions = []
     new_meta = {"columns": new_dataset_columns}
+    new_names_bag = " ".join([c["normalized_name"] for c in new_dataset_columns])
 
     for ld in logical_datasets:
-        # Get one representative member dataset's columns
+        score = 0.0
+        # 1. Compare against LD Name and Description (Semantic/Context Match)
+        try:
+            name_context_score = _embedding_similarity(new_names_bag, f"{ld.dataset_name} {ld.description}")
+            # Boost if name matches exactly
+            if ld.dataset_name.lower() in new_names_bag.lower() or any(ld.dataset_name.lower() in n.lower() for n in [c["normalized_name"] for c in new_dataset_columns]):
+                name_context_score = max(name_context_score, 0.8)
+        except Exception:
+            name_context_score = 0.0
+
+        # 2. Compare against existing member datasets
+        member_score = 0.0
         mapping = db.execute(
             select(LogicalDatasetMapping)
             .where(LogicalDatasetMapping.logical_dataset_id == ld.id)
             .limit(1)
         ).scalars().first()
-        if not mapping:
-            continue
 
-        ref_cols = db.execute(
-            select(DatasetColumn).where(DatasetColumn.dataset_id == mapping.dataset_id)
-        ).scalars().all()
-        ref_meta = {"columns": [{"normalized_name": c.normalized_name, "data_type": c.data_type} for c in ref_cols]}
+        if mapping:
+            ref_cols = db.execute(
+                select(DatasetColumn).where(DatasetColumn.dataset_id == mapping.dataset_id)
+            ).scalars().all()
+            ref_meta = {"columns": [{"normalized_name": c.normalized_name, "data_type": c.data_type} for c in ref_cols]}
+            member_score = score_dataset_similarity(new_meta, ref_meta)
+        
+        # Combined score: prioritize member similarity if it exists, otherwise use name context
+        score = max(member_score, name_context_score)
 
-        score = score_dataset_similarity(new_meta, ref_meta)
         if score >= threshold:
             # Generate the specific column alignment
-            target_cols = [c.normalized_name for c in ref_cols]
+            # If LD already has columns, use them. Otherwise use the new file's own columns as the target keys.
+            ld_target_keys = get_logical_schema_columns(db, ld.id)
             source_cols = [c["normalized_name"] for c in new_dataset_columns]
-            suggested_map = generate_suggested_mapping(source_cols, target_cols)
+            
+            if ld_target_keys:
+                suggested_map = generate_suggested_mapping(
+                    source_cols, 
+                    ld_target_keys, 
+                    sample_data=sample_data, 
+                    schema_description=ld.description
+                )
+            else:
+                # FIRST FILE: Mapping is identity mapping (source -> source)
+                # This "Initializes" the logical schema
+                suggested_map = {c: c for c in source_cols}
 
             suggestions.append({
                 "logical_dataset_id": ld.id,
@@ -125,14 +167,39 @@ def suggest_logical_dataset(
     return suggestions
 
 
-def generate_suggested_mapping(source_cols: list[str], target_cols: list[str]) -> dict:
+def generate_suggested_mapping(
+    source_cols: list[str], 
+    target_cols: list[str],
+    sample_data: list[dict] = None,
+    schema_description: str = None
+) -> dict:
     """
-    Automatically Suggest a mapping between source columns and target columns.
-    Returns: { "source_col": "target_col" }
+    Suggest a mapping between source columns and target columns using Gemini AI preferably,
+    and falling back to fuzzy matching if AI is unavailable or fails.
     """
     mapping = {}
+    
+    # Try AI Mapping first if sample data is provided
+    if sample_data is not None:
+        try:
+            from .gemini import map_columns_with_ai
+            ai_mappings = map_columns_with_ai(source_cols, sample_data, target_cols, schema_description)
+            if ai_mappings:
+                for m in ai_mappings:
+                    # Only accept confident mappings
+                    if m.get("target") and m.get("confidence", 0) > 0.60:
+                        mapping[m["source"]] = m["target"]
+                
+                # If AI returned at least some mappings, we trust it and return
+                if mapping:
+                    print(f"DEBUG: Logical Dataset AI Mapping Success: {mapping}")
+                    return mapping
+        except Exception as e:
+            print(f"DEBUG: AI Mapping fallback triggered due to error: {e}")
+
+    # Fallback to Fuzzy Matching
+    print("DEBUG: Using RapidFuzz fallback for Logical Dataset mapping")
     for s_col in source_cols:
-        # Find best fuzzy match in target
         best_match = None
         best_score = 0
         for t_col in target_cols:
@@ -141,8 +208,8 @@ def generate_suggested_mapping(source_cols: list[str], target_cols: list[str]) -
                 best_score = score
                 best_match = t_col
         
-        # Only map if match is decent (e.g. > 70%)
-        if best_match and best_score > 70:
+        if best_match and best_score > 65:
             mapping[s_col] = best_match
             
     return mapping
+

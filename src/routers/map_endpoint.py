@@ -18,6 +18,7 @@ from ..services.corrections import (
 from ..services.data_processor import parse_file, load_dataframe
 from ..services.mapper import evaluate_best_match, score_mapping
 from ..services.profiler import profile_column
+from ..utils.json_utils import sanitize_nans
 
 router = APIRouter()
 
@@ -123,12 +124,12 @@ async def map_upload(
 
     mappings, _ = process_mapping_for_schema(db, target_schema, df)
 
-    return {
+    return sanitize_nans({
         "file": file.filename,
         "detected_schema": target_schema.schema_name,
         "total_rows_detected": len(df),
         "mappings": mappings
-    }
+    })
 
 @router.post("/confirm")
 def map_confirm(req: CorrectionRequest, db: Session = Depends(get_db)):
@@ -174,7 +175,8 @@ async def manual_transform(
     transformed_data = []
     
     # Expect confirmed_mappings to be [{"source": "A", "target": "target_A"}]
-    records = df.to_dict(orient="records")
+    # Clean NaNs before converting to dict
+    records = df.where(pd.notna(df), None).to_dict(orient="records")
     for row in records:
         new_row = {}
         for m in confirmed_mappings:
@@ -183,11 +185,11 @@ async def manual_transform(
             if source and target:
                 # Strip source name just in case it was passed with whitespace
                 val = row.get(str(source).strip())
-                new_row[target] = None if pd.isna(val) else val
+                new_row[target] = val # already handled by None in records
         if new_row:
             transformed_data.append(new_row)
         
-    return {"transformed_rows": transformed_data}
+    return sanitize_nans({"transformed_rows": transformed_data})
 
 @router.post("/detect-schema")
 async def detect_schema(
@@ -219,13 +221,13 @@ async def detect_schema(
             best_schema = schema
             best_mappings = mappings
 
-    return {
+    return sanitize_nans({
         "detected_schema": best_schema.schema_name if best_schema else None,
         "confidence": best_score,
         "row_count": len(df),
         "headers": df.columns.tolist(),
         "mappings": best_mappings
-    }
+    })
 
 @router.post("/auto-transform")
 async def auto_transform(
@@ -292,17 +294,18 @@ async def auto_transform(
     transformed_data = []
     
     # Use to_dict for cleaner iteration
-    records = df.to_dict(orient="records")
-    for row in records:
+    # Use a clean dict for records to avoid NaN in JSON
+    records_clean = df.where(pd.notna(df), None).to_dict(orient="records")
+    
+    for row in records_clean:
         new_row = {}
         for target, source in target_to_source.items():
             val = row.get(source)
-            # Handle NaN/None
-            new_row[target] = None if pd.isna(val) else val
+            new_row[target] = val # already handled by where clause
             
         transformed_data.append(new_row)
 
-    return {
+    return sanitize_nans({
         "detected_schema": target_schema.schema_name,
         "input_filename": file.filename,
         "row_count": len(df),
@@ -310,6 +313,6 @@ async def auto_transform(
         "headers_detected": df.columns.tolist(),
         "mappings_used": len(target_to_source),
         "target_to_source_map": target_to_source,
-        "sample_input_records": records[:2] if records else [],
+        "sample_input_records": records_clean[:2] if records_clean else [],
         "transformed_rows": transformed_data
-    }
+    })

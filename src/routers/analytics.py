@@ -17,6 +17,7 @@ from typing import Optional
 from ..database import get_db, engine
 from ..models import Dataset, LogicalDataset, LogicalDatasetMapping, DatasetColumn, Metric
 from ..services.dataset_store import query_dataset
+from ..utils.json_utils import sanitize_nans
 
 router = APIRouter()
 
@@ -74,11 +75,11 @@ def analytics_query(req: QueryRequest, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Query failed: {str(e)}")
 
-    return {
+    return sanitize_nans({
         "columns": result["columns"],
         "row_count": len(result["rows"]),
         "rows": result["rows"],
-    }
+    })
 
 
 @router.get("/datasets/{dataset_id}/preview")
@@ -94,13 +95,13 @@ def preview_dataset(dataset_id: str, limit: int = 50, db: Session = Depends(get_
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to preview dataset: {str(e)}")
 
-    return {
+    return sanitize_nans({
         "dataset_id": dataset_id,
         "table_name": dataset.table_name,
         "columns": result["columns"],
         "row_count": len(result["rows"]),
         "rows": result["rows"],
-    }
+    })
 
 
 @router.get("/logical-datasets/{logical_dataset_id}/preview")
@@ -127,13 +128,13 @@ def preview_logical_dataset(logical_dataset_id: str, limit: int = 50, db: Sessio
             "message": "No data mapped yet."
         }
 
-    return {
+    return sanitize_nans({
         "logical_dataset": ld.dataset_name,
         "table_name": ld.table_name,
         "columns": result["columns"],
         "row_count": len(result["rows"]),
         "rows": result["rows"],
-    }
+    })
 
 
 # ── Semantic Metrics Layer ───────────────────────────────────────────────────
@@ -198,8 +199,8 @@ def query_metric(req: MetricQueryRequest, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to calculate metric: {str(e)}")
 
-    return {
+    return sanitize_nans({
         "metric_name": metric.metric_name,
         "value": result["rows"][0][metric.metric_name] if result["rows"] else None,
         "result_set": result["rows"]
-    }
+    })

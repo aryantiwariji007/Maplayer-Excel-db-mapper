@@ -1,7 +1,7 @@
 import pandas as pd
 import io
 
-def load_dataframe(file_bytes: bytes, filename: str, max_search_rows: int = 20) -> pd.DataFrame:
+def load_dataframe(file_bytes: bytes, filename: str, max_search_rows: int = 50) -> pd.DataFrame:
     """
     Loads a file into a pandas DataFrame, auto-detecting the true header row 
     by skipping initial metadata/title rows.
@@ -13,29 +13,68 @@ def load_dataframe(file_bytes: bytes, filename: str, max_search_rows: int = 20) 
     else:
         raise ValueError("Unsupported file format. Please upload a CSV or Excel file.")
 
+    print(f"DEBUG: Auto-detecting header for {filename} (deep scan)...")
     best_row_idx = 0
-    best_score = -1
-
-    # Find the row with the most unique string values (likely the header)
+    best_score = -1000.0
+    
+    # We'll use an early-exit strategy: the first row that is 100% text and reasonably wide
+    # is almost certainly the header.
     for idx, row in df_raw.iterrows():
-        vals = row.dropna().astype(str).str.strip()
+        populated = row.dropna()
+        if len(populated) == 0:
+            continue
+            
+        vals = populated.astype(str).str.strip()
         vals = vals[vals != ""]
-        
         if len(vals) == 0:
             continue
             
-        unique_vals = set(vals)
-        score = len(unique_vals)
+        text_cells = 0
+        numeric_cells = 0
+        for val in vals:
+            # Clean for numeric check (commas, spaces, currency)
+            clean_val = val.replace(",", "").replace(" ", "").replace("$", "").replace("%", "")
+            try:
+                # If it can be a number, it's likely data
+                if clean_val and (clean_val[0].isdigit() or (len(clean_val)>1 and clean_val[0] in ('-','.') and clean_val[1].isdigit())):
+                    float(clean_val)
+                    numeric_cells += 1
+                else:
+                    raise ValueError()
+            except ValueError:
+                val_lower = val.lower()
+                if val_lower not in ("true", "false", "nan", "nat", "none", "null"):
+                    text_cells += 1
         
+        # Early exit: 100% text and at least 3 columns populated? 
+        # This is almost guaranteed to be the header row.
+        if numeric_cells == 0 and text_cells >= 3:
+            print(f"DEBUG: Found perfect header candidate at Row {idx} (Text columns: {text_cells}). Stopping early.")
+            best_row_idx = idx
+            best_score = 999
+            break
+            
+        # Otherwise, calculate a weighted score
+        unique_text_count = len(set([v for v in vals if v.lower() not in ("true", "false", "nan", "nat")]))
+        score = unique_text_count - (numeric_cells * 20) # Heavy penalty
+        
+        print(f"DEBUG: Row {idx} -> Text: {text_cells}, Numeric: {numeric_cells}, Unique: {unique_text_count}, Final Score: {score}")
+
         if score > best_score:
             best_score = score
             best_row_idx = idx
+
+    print(f"DEBUG: Final Decision -> Row Index {best_row_idx} (Score: {best_score})")
 
     # Load full dataset skipping the metadata rows
     if filename.endswith(".csv"):
         df = pd.read_csv(io.BytesIO(file_bytes), skiprows=best_row_idx)
     else:
-        df = pd.read_excel(io.BytesIO(file_bytes), skiprows=best_row_idx)
+        try:
+            df = pd.read_excel(io.BytesIO(file_bytes), skiprows=best_row_idx, engine='openpyxl')
+        except:
+            df = pd.read_excel(io.BytesIO(file_bytes), skiprows=best_row_idx)
+
 
     # Clean headers: stringify and strip whitespace
     df.columns = [str(c).strip() for c in df.columns]

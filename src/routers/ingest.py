@@ -19,6 +19,7 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from typing import Optional, Annotated
 import uuid
+import pandas as pd
 
 from ..database import get_db, engine
 from ..models import (
@@ -41,13 +42,15 @@ from ..services.dataset_store import (
 )
 from ..services.schema_inference import pg_type
 from ..services.similarity import suggest_logical_dataset
+from ..utils.json_utils import sanitize_nans
 
 router = APIRouter()
 
 class MapDatasetRequest(BaseModel):
     dataset_id: str
     logical_dataset_id: str
-    column_mapping: dict  # {"source_normalized_col": "logical_col"}
+    column_mapping: Optional[dict] = None  # Optional if auto_map is true
+    auto_map: bool = False
 
 def perform_mapping(req: MapDatasetRequest, db: Session):
     """Internal helper to avoid cyclic or premature endpoint calls."""
@@ -58,6 +61,23 @@ def perform_mapping(req: MapDatasetRequest, db: Session):
     ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == req.logical_dataset_id)).scalars().first()
     if not ld:
         raise Exception("Logical dataset not found")
+
+    if req.auto_map and not req.column_mapping:
+        # Generate mapping on the fly using AI settings
+        cols = db.execute(select(DatasetColumn).where(DatasetColumn.dataset_id == req.dataset_id)).scalars().all()
+        col_dicts = [{"normalized_name": c.normalized_name, "data_type": c.data_type} for c in cols]
+        suggestions = suggest_logical_dataset(db, col_dicts, dataset.product_id)
+        
+        # Find the specific LD suggestion
+        best = next((s for s in suggestions if s["logical_dataset_id"] == req.logical_dataset_id), None)
+        if best:
+            req.column_mapping = best["suggested_mapping"]
+        else:
+            # Identity mapping fallback (first file case)
+            req.column_mapping = {c.normalized_name: c.normalized_name for c in cols}
+
+    if not req.column_mapping:
+        raise Exception("Column mapping is required (or set auto_map=true)")
 
     mapping = LogicalDatasetMapping(
         logical_dataset_id=req.logical_dataset_id,
@@ -106,6 +126,7 @@ async def ingest_upload(
     product_id: Optional[str] = Form(None),
     product_id_alt: Optional[str] = Form(None, alias="product-id"),
     auto_map: bool = Form(False),
+    logical_dataset_name: Optional[str] = Form(None),
 ):
     # Use either underscore or hyphen version
     final_product_id = product_id or product_id_alt
@@ -179,27 +200,68 @@ async def ingest_upload(
 
     # Step 6 — Suggest logical datasets
     col_dicts = [{"normalized_name": c["normalized_name"], "data_type": c["data_type"]} for c in columns_meta]
+    
+    # Extract sample data for Gemini context
+    sample_data = df.head(5).where(pd.notna(df.head(5)), None).to_dict(orient="records")
+    
     try:
-        suggestions = suggest_logical_dataset(db, col_dicts, final_product_id)
-    except Exception:
+        suggestions = suggest_logical_dataset(
+            db, 
+            col_dicts, 
+            final_product_id,
+            sample_data=sample_data
+        )
+    except Exception as e:
+        print(f"DEBUG: Failed to suggest logical datasets: {e}")
         suggestions = []
 
     # Step 7 — Proactive Auto-Mapping (AI-powered)
     auto_mapped = False
-    if auto_map and suggestions and suggestions[0]["similarity_score"] > 0.85:
-        best = suggestions[0]
-        try:
-            map_req = MapDatasetRequest(
-                dataset_id=dataset_meta["id"],
-                logical_dataset_id=best["logical_dataset_id"],
-                column_mapping=best["suggested_mapping"]
-            )
-            perform_mapping(map_req, db)
-            auto_mapped = True
-        except Exception as e:
-            print(f"DEBUG: Auto-mapping failed: {e}")
+    target_ld_id = None
+    target_ld_name = None
 
-    return {
+    # Handle explicit logical dataset target
+    if logical_dataset_name:
+        # Find or create LD
+        ld = db.execute(select(LogicalDataset).where(
+            LogicalDataset.product_id == final_product_id,
+            LogicalDataset.dataset_name == logical_dataset_name
+        )).scalars().first()
+        
+        if not ld:
+            # Create it
+            table_name = f"analytics_{str(uuid.uuid4()).replace('-', '_')}"
+            ld = LogicalDataset(
+                product_id=final_product_id,
+                dataset_name=logical_dataset_name,
+                table_name=table_name
+            )
+            db.add(ld)
+            db.commit()
+            db.refresh(ld)
+        
+        target_ld_id = ld.id
+        target_ld_name = ld.dataset_name
+        auto_map = True # Force auto-map if name provided
+
+    if auto_map:
+        if not target_ld_id and suggestions and suggestions[0]["similarity_score"] > 0.50:
+            target_ld_id = suggestions[0]["logical_dataset_id"]
+            target_ld_name = suggestions[0]["logical_dataset_name"]
+
+        if target_ld_id:
+            try:
+                map_req = MapDatasetRequest(
+                    dataset_id=dataset_meta["id"],
+                    logical_dataset_id=target_ld_id,
+                    auto_map=True
+                )
+                perform_mapping(map_req, db)
+                auto_mapped = True
+            except Exception as e:
+                print(f"DEBUG: Auto-mapping failed: {e}")
+
+    return sanitize_nans({
         "dataset_id": dataset_meta["id"],
         "table_name": dataset_meta["table_name"],
         "rows": rows_inserted,
@@ -214,8 +276,8 @@ async def ingest_upload(
         "file_name": file.filename,
         "logical_dataset_suggestions": suggestions,
         "auto_mapped": auto_mapped,
-        "mapped_to": suggestions[0]["logical_dataset_name"] if auto_mapped else None
-    }
+        "mapped_to": target_ld_name if auto_mapped else None
+    })
 
 
 # ── Dataset Registry ─────────────────────────────────────────────────────────
@@ -336,8 +398,7 @@ def list_logical_datasets(product_id: str, db: Session = Depends(get_db)):
 @router.post("/dataset/map")
 def map_dataset_to_logical(req: MapDatasetRequest, db: Session = Depends(get_db)):
     """
-    Assign a physical dataset to a logical dataset with an explicit column mapping.
-    E.g. {"value": "temperature", "time": "timestamp"}
+    Assign a physical dataset to a logical dataset with an explicit or AI-suggested column mapping.
     """
     try:
         perform_mapping(req, db)

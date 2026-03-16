@@ -15,13 +15,21 @@ def map_columns_with_ai(source_columns, sample_data, target_columns, schema_desc
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         
+        # Support both strict structural objects and plain string lists for logical schemas
+        is_string_list = all(isinstance(c, str) for c in target_columns)
+        
+        if is_string_list:
+            formatted_targets = json.dumps([{"key": c} for c in target_columns], indent=2)
+        else:
+            formatted_targets = json.dumps([{ 'key': getattr(c, 'key', str(c)), 'label': getattr(c, 'label', ''), 'description': getattr(c, 'description', '') } for c in target_columns], indent=2)
+
         prompt = f"""
         You are an expert data migration assistant. Your task is to map source columns from an uploaded file to a specific target schema.
         
-        Target Schema Description: {schema_description or "A strict data schema"}
+        Target Schema Description: {schema_description or "A dynamic analytics schema"}
         
-        Target Schema Fields:
-        {json.dumps([{ 'key': c.key, 'label': c.label, 'description': c.description, 'examples': c.examples } for c in target_columns], indent=2)}
+        Target Schema Fields (keys you can map to):
+        {formatted_targets}
         
         Source Columns To Map: {json.dumps(source_columns)}
         
