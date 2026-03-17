@@ -4,6 +4,9 @@ from .database import init_db
 from .services.qdrant_service import init_qdrant
 from .routers import schemas, map_endpoint, ingest, analytics
 import uvicorn
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI(title="MapLayer API", version="3.0")
 

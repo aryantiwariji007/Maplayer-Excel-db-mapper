@@ -197,19 +197,12 @@ def generate_suggested_mapping(
         except Exception as e:
             print(f"DEBUG: AI Mapping fallback triggered due to error: {e}")
 
-    # Fallback to Fuzzy Matching
-    print("DEBUG: Using RapidFuzz fallback for Logical Dataset mapping")
-    for s_col in source_cols:
-        best_match = None
-        best_score = 0
-        for t_col in target_cols:
-            score = fuzz.token_sort_ratio(s_col, t_col)
-            if score > best_score:
-                best_score = score
-                best_match = t_col
-        
-        if best_match and best_score > 65:
-            mapping[s_col] = best_match
-            
+    # Fallback to Automatic Column Reconciliation
+    print("DEBUG: Using Automatic Column Reconciliation as mapping fallback")
+    from .reconciliation import reconcile_columns
+    
+    recon_mapping = reconcile_columns(source_cols, target_cols)
+    if recon_mapping:
+         mapping.update(recon_mapping)
+         
     return mapping
-

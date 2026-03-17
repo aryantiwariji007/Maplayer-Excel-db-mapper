@@ -16,7 +16,8 @@ from typing import Optional
 
 from ..database import get_db, engine
 from ..models import Dataset, LogicalDataset, LogicalDatasetMapping, DatasetColumn, Metric
-from ..services.dataset_store import query_dataset
+from ..services.dataset_store import query_dataset, get_table_columns
+from ..services.gemini import discover_metrics_with_ai
 from ..utils.json_utils import sanitize_nans
 
 router = APIRouter()
@@ -204,3 +205,90 @@ def query_metric(req: MetricQueryRequest, db: Session = Depends(get_db)):
         "value": result["rows"][0][metric.metric_name] if result["rows"] else None,
         "result_set": result["rows"]
     })
+
+
+@router.get("/logical-datasets/{logical_dataset_id}/discover-metrics")
+def discover_metrics(logical_dataset_id: str, db: Session = Depends(get_db)):
+    """
+    Automatically discover business metrics for a logical dataset using AI.
+    """
+    ld = db.execute(
+        select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)
+    ).scalars().first()
+    
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found")
+
+    # 1. Get column schema of the materialized table
+    try:
+        all_cols = get_table_columns(engine, ld.table_name)
+    except Exception:
+        all_cols = []
+
+    if not all_cols:
+        raise HTTPException(
+            status_code=400, 
+            detail="Logical dataset table not found or empty. Map some data first."
+        )
+
+    # 2. Get sample data (first 5 rows) to help AI understand the context
+    sample_sql = f'SELECT * FROM "{ld.table_name}" LIMIT 5'
+    sample_res = query_dataset(engine, sample_sql)
+    sample_data = sample_res["rows"]
+
+    # 3. Call Gemini to suggest metrics
+    # We pass column names. For discovery, we can just pass names or types.
+    # To get types, we'd need a bit more logic, but names are often enough for discovery.
+    # Let's try to get types if possible.
+    suggestions = discover_metrics_with_ai(
+        dataset_name=ld.dataset_name,
+        columns=all_cols,
+        sample_data=sample_data
+    )
+
+    return {
+        "logical_dataset_id": logical_dataset_id,
+        "logical_dataset_name": ld.dataset_name,
+        "suggested_metrics": suggestions
+    }
+
+
+class BulkMetricSaveRequest(BaseModel):
+    product_id: str
+    logical_dataset_id: str
+    metrics: list[dict] # Each dict: {metric_name, sql_expression, description}
+
+@router.post("/metrics/bulk-save")
+def bulk_save_metrics(req: BulkMetricSaveRequest, db: Session = Depends(get_db)):
+    """Save multiple discovered metrics at once."""
+    # Validate logical dataset exists
+    ld = db.execute(
+        select(LogicalDataset).where(
+            LogicalDataset.id == req.logical_dataset_id,
+            LogicalDataset.product_id == req.product_id
+        )
+    ).scalars().first()
+    
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found or product_id mismatch")
+
+    saved_ids = []
+    try:
+        for m in req.metrics:
+            metric = Metric(
+                product_id=req.product_id,
+                metric_name=m["metric_name"],
+                logical_dataset_id=req.logical_dataset_id,
+                sql_expression=m["sql_expression"],
+                description=m.get("description"),
+            )
+            db.add(metric)
+            db.flush() # flush to get ID
+            saved_ids.append(metric.id)
+        
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Failed to save metrics: {str(e)}")
+
+    return {"status": "success", "saved_count": len(saved_ids), "metric_ids": saved_ids}

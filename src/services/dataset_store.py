@@ -155,24 +155,56 @@ def append_to_analytics_table(
 ) -> None:
     """
     INSERT INTO the materialized analytics table from a source uploaded dataset table.
+    Now with intelligent source-to-target casting.
     """
-    source_cols = []
+    # 1. Inspect both source and target types
+    target_types = get_table_schema_dict(engine, analytics_table)
+    source_types = get_table_schema_dict(engine, source_table)
+    
+    source_cols_exprs = []
     target_cols = []
-    for source_col, target_col in mapping.items():
-        source_cols.append(f'"{source_col}"')
-        target_cols.append(f'"{target_col}"')
+    
+    # 2. Build explicit casts for each mapped column
+    for src, tgt in mapping.items():
+        target_type = target_types.get(tgt, "text").lower()
+        source_type = source_types.get(src, "text").lower()
         
-    source_cols_str = ", ".join(source_cols)
+        # Build a safe casting expression
+        if "timestamp" in target_type:
+            # Source can be timestamp, text, or bigint
+            source_cols_exprs.append(f'"{src}"::timestamp')
+        elif "int" in target_type or "bigint" in target_type:
+            # Special check: timestamp to bigint requires explicit epoch extraction
+            if "timestamp" in source_type:
+                source_cols_exprs.append(f'EXTRACT(EPOCH FROM "{src}")::bigint')
+            else:
+                source_cols_exprs.append(f'"{src}"::bigint')
+        elif "numeric" in target_type or "double" in target_type or "float" in target_type:
+             source_cols_exprs.append(f'"{src}"::double precision')
+        elif "boolean" in target_type:
+             source_cols_exprs.append(f'"{src}"::boolean')
+        elif "json" in target_type:
+             source_cols_exprs.append(f'"{src}"::jsonb')
+        else:
+            source_cols_exprs.append(f'"{src}"::text')
+            
+        target_cols.append(f'"{tgt}"')
+        
+    source_expr_str = ", ".join(source_cols_exprs)
     target_cols_str = ", ".join(target_cols)
     
     sql = f"""
     INSERT INTO "{analytics_table}" (dataset_id, {target_cols_str})
-    SELECT '{dataset_id}', {source_cols_str}
+    SELECT '{dataset_id}', {source_expr_str}
     FROM "{source_table}";
     """
-    with engine.connect() as conn:
-        conn.execute(text(sql))
-        conn.commit()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(sql))
+            conn.commit()
+    except Exception as e:
+        print(f"Materialization Failed for {source_table} -> {analytics_table}: {e}")
+        raise e
 
 
 def get_table_columns(engine: Engine, table_name: str) -> list[str]:
@@ -199,3 +231,18 @@ def add_columns_to_analytics_table(engine: Engine, table_name: str, new_columns:
     with engine.connect() as conn:
         conn.execute(text(alter_sql))
         conn.commit()
+
+
+def get_table_schema_dict(engine, table_name: str) -> dict:
+    """Returns a mapping of column_name -> data_type for a table."""
+    # Handle the fact that table_name might be quoted in queries but exists unquoted in info schema
+    clean_table = table_name.replace('"', '')
+    sql = """
+    SELECT column_name, data_type 
+    FROM information_schema.columns 
+    WHERE table_name = :t
+    """
+    with engine.connect() as conn:
+        res = conn.execute(text(sql), {"t": clean_table})
+        # information_schema.columns returns some names that are useful for casting
+        return {r[0]: r[1] for r in res.fetchall()}
