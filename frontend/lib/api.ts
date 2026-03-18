@@ -1,0 +1,210 @@
+import axios from "axios";
+import type {
+  TargetSchemaResponse,
+  TargetSchemaCreate,
+  DatasetMetadata,
+  UploadResult,
+  LogicalDataset,
+  LogicalDatasetCreate,
+  MappingResult,
+  MapConfirmRequest,
+  QueryRequest,
+  QueryResult,
+  MetricDefinition,
+  MetricResult,
+  DiscoveredMetric,
+  BulkSaveMetricsRequest,
+  PreviewData,
+} from "@/types";
+
+const api = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000",
+  timeout: 60000,
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response && error.response.data && error.response.data.detail) {
+      // Re-throw with the actual backend error message string
+      return Promise.reject(new Error(error.response.data.detail));
+    }
+    return Promise.reject(error);
+  }
+);
+
+// =============================
+// SCHEMAS — /schemas
+// =============================
+export const schemasApi = {
+  list: (productId?: string): Promise<TargetSchemaResponse[]> =>
+    api
+      .get("/schemas/", { params: productId ? { product_id: productId } : {} })
+      .then((r) => r.data),
+
+  create: (data: TargetSchemaCreate): Promise<TargetSchemaResponse> =>
+    api.post("/schemas/", data).then((r) => r.data),
+
+  delete: (schemaId: number): Promise<{ message: string }> =>
+    api.delete(`/schemas/${schemaId}`).then((r) => r.data),
+};
+
+// =============================
+// INGEST — /ingest
+// =============================
+export const ingestApi = {
+  uploadSingle: (
+    file: File,
+    productId: string,
+    autoMap?: boolean,
+    logicalDatasetName?: string
+  ): Promise<UploadResult> => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("product_id", productId);
+    if (autoMap !== undefined) form.append("auto_map", String(autoMap));
+    if (logicalDatasetName)
+      form.append("logical_dataset_name", logicalDatasetName);
+    return api.post("/ingest/upload", form).then((r) => r.data);
+  },
+
+  uploadBulk: (
+    files: File[],
+    productId: string,
+    autoMap?: boolean,
+    logicalDatasetName?: string
+  ): Promise<UploadResult[]> => {
+    const form = new FormData();
+    files.forEach((f) => form.append("files", f));
+    form.append("product_id", productId);
+    if (autoMap !== undefined) form.append("auto_map", String(autoMap));
+    if (logicalDatasetName)
+      form.append("logical_dataset_name", logicalDatasetName);
+    return api.post("/ingest/upload-bulk", form).then((r) => r.data);
+  },
+
+  listDatasets: (productId: string): Promise<DatasetMetadata[]> =>
+    api
+      .get("/ingest/datasets", { params: { product_id: productId } })
+      .then((r) => r.data),
+
+  getDataset: (datasetId: string): Promise<DatasetMetadata> =>
+    api.get(`/ingest/datasets/${datasetId}`).then((r) => r.data),
+
+  deleteDataset: (datasetId: string): Promise<{ message: string }> =>
+    api.delete(`/ingest/datasets/${datasetId}`).then((r) => r.data),
+
+  createLogicalDataset: (data: LogicalDatasetCreate): Promise<LogicalDataset> =>
+    api.post("/ingest/logical-datasets", data).then((r) => r.data),
+
+  deleteLogicalDataset: (id: string): Promise<{ message: string }> =>
+    api.delete(`/ingest/logical-datasets/${id}`).then((r) => r.data),
+
+  listLogicalDatasets: (productId: string): Promise<LogicalDataset[]> =>
+    api
+      .get("/ingest/logical-datasets", { params: { product_id: productId } })
+      .then((r) => r.data),
+
+  mapDatasetToLogical: (
+    datasetId: string,
+    logicalDatasetId?: string,
+    autoMap?: boolean,
+    columnMapping?: Record<string, string>
+  ): Promise<{ message: string }> => {
+    const form = new FormData();
+    form.append("dataset_id", datasetId);
+    if (logicalDatasetId) form.append("logical_dataset_id", logicalDatasetId);
+    if (autoMap !== undefined) form.append("auto_map", String(autoMap));
+    if (columnMapping)
+      form.append("column_mapping", JSON.stringify(columnMapping));
+    return api.post("/ingest/dataset/map", form).then((r) => r.data);
+  },
+};
+
+// =============================
+// MAPPING ENGINE — /map
+// =============================
+export const mapApi = {
+  mapFile: (
+    productId: string,
+    file: File,
+    schemaName?: string
+  ): Promise<MappingResult> => {
+    const form = new FormData();
+    form.append("product_id", productId);
+    form.append("file", file);
+    if (schemaName) form.append("schema_name", schemaName);
+    return api.post("/map/", form).then((r) => r.data);
+  },
+
+  confirm: (data: MapConfirmRequest): Promise<{ message: string }> =>
+    api.post("/map/confirm", data).then((r) => r.data),
+
+  transform: (
+    file: File,
+    mappingsJson: Record<string, string>
+  ): Promise<MappingResult> => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("mappings_json", JSON.stringify(mappingsJson));
+    return api.post("/map/transform", form).then((r) => r.data);
+  },
+
+  detectSchema: (
+    productId: string,
+    file: File
+  ): Promise<{
+    schema_name: string;
+    confidence: number;
+    column_mappings: Record<string, string>;
+  }> => {
+    const form = new FormData();
+    form.append("product_id", productId);
+    form.append("file", file);
+    return api.post("/map/detect-schema", form).then((r) => r.data);
+  },
+
+  autoTransform: (productId: string, file: File): Promise<MappingResult> => {
+    const form = new FormData();
+    form.append("product_id", productId);
+    form.append("file", file);
+    return api.post("/map/auto-transform", form).then((r) => r.data);
+  },
+};
+
+// =============================
+// ANALYTICS — /analytics
+// =============================
+export const analyticsApi = {
+  query: (data: QueryRequest): Promise<QueryResult> =>
+    api.post("/analytics/query", data).then((r) => r.data),
+
+  previewDataset: (datasetId: string): Promise<PreviewData> =>
+    api.get(`/analytics/datasets/${datasetId}/preview`).then((r) => r.data),
+
+  previewLogicalDataset: (id: string): Promise<PreviewData> =>
+    api
+      .get(`/analytics/logical-datasets/${id}/preview`)
+      .then((r) => r.data),
+
+  createMetric: (data: MetricDefinition): Promise<MetricDefinition> =>
+    api.post("/analytics/metrics", data).then((r) => r.data),
+
+  listMetrics: (productId: string): Promise<MetricDefinition[]> =>
+    api
+      .get("/analytics/metrics", { params: { product_id: productId } })
+      .then((r) => r.data),
+
+  runMetric: (metricId: number): Promise<MetricResult> =>
+    api.post("/analytics/metrics/query", { metric_id: metricId }).then((r) => r.data),
+
+  discoverMetrics: (logicalDatasetId: string): Promise<DiscoveredMetric[]> =>
+    api
+      .get(`/analytics/logical-datasets/${logicalDatasetId}/discover-metrics`)
+      .then((r) => r.data.suggested_metrics),
+
+  bulkSaveMetrics: (data: BulkSaveMetricsRequest): Promise<MetricDefinition[]> =>
+    api.post("/analytics/metrics/bulk-save", data).then((r) => r.data),
+};
+
+export default api;
