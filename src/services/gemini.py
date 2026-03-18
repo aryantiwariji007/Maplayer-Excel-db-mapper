@@ -69,6 +69,81 @@ def map_columns_with_ai(source_columns, sample_data, target_columns, schema_desc
         print(f"Gemini API Error: {e}")
         return []
 
+
+def choose_best_schema_with_ai(
+    source_columns: list,
+    sample_data: list,
+    static_candidates: list,
+    dynamic_candidates: list,
+) -> dict | None:
+    """
+    Ask Gemini AI to choose the best matching schema from all available candidates.
+    
+    Returns a dict:
+    {
+        "schema_type": "static" | "dynamic" | "none",
+        "schema_id": "...",
+        "schema_name": "...",
+        "confidence": 0.0-1.0,
+        "column_mapping": {"source_col": "target_col", ...},
+        "reason": "..."
+    }
+    """
+    if not GEMINI_API_KEY:
+        return None
+    
+    if not static_candidates and not dynamic_candidates:
+        return None
+
+    try:
+        model = genai.GenerativeModel('gemini-3-flash-preview')
+
+        prompt = f"""
+You are a world-class data integration engineer. You are matching an uploaded Excel/CSV file to the most appropriate target schema.
+
+**Source File Columns:**
+{json.dumps(source_columns, indent=2)}
+
+**Sample Data (first rows of the file):**
+{json.dumps(sample_data[:5], indent=2, cls=DateTimeEncoder)}
+
+**Available Static Schemas (fixed, production DB contracts):**
+{json.dumps([{"id": s["id"], "name": s["name"], "description": s["description"], "fields": s["target_keys"]} for s in static_candidates], indent=2)}
+
+**Available Dynamic Schemas (AI-discovered schema groups):**
+{json.dumps([{"id": d["id"], "name": d["name"], "description": d["description"], "known_columns": d["target_keys"]} for d in dynamic_candidates], indent=2)}
+
+**Your Task:**
+1. Determine which schema (static or dynamic) this file MOST LIKELY belongs to, based on columns and data.
+2. Prefer static schemas if the file is clearly following a strict contract.
+3. Prefer dynamic schemas if the file is a variation of an already-seen dataset type.
+4. If no schema matches, return schema_type "none".
+5. For the winning schema, provide a complete column_mapping of source columns to target schema keys.
+   - Only map source columns where you are confident (confidence > 0.6).
+   - For dynamic schemas with no existing columns, map each source column to itself (identity mapping).
+
+Respond ONLY with valid JSON:
+{{
+    "schema_type": "static" | "dynamic" | "none",
+    "schema_id": "<id of the chosen schema>",
+    "schema_name": "<name of the chosen schema>",
+    "confidence": 0.85,
+    "column_mapping": {{"source_col_1": "target_col_a", "source_col_2": "target_col_b"}},
+    "reason": "Brief explanation of why this schema was chosen"
+}}
+"""
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        result = json.loads(response.text)
+        print(f"DEBUG: Gemini Schema Resolution: type={result.get('schema_type')}, schema={result.get('schema_name')}, confidence={result.get('confidence')}")
+        return result
+    except Exception as e:
+        print(f"Gemini choose_best_schema_with_ai Error: {e}")
+        return None
+
+
 def discover_metrics_with_ai(dataset_name, columns, sample_data):
     """
     Suggest business metrics based on a dataset's columns and sample data.

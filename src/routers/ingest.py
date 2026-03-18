@@ -15,7 +15,7 @@ Endpoints:
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.orm import Session
 from typing import Optional, Annotated, List
 import uuid
@@ -213,6 +213,7 @@ async def ingest_upload(
         file_name=dataset_meta["file_name"],
         table_name=dataset_meta["table_name"],
         row_count=rows_inserted,
+        # schema_type and mapped_schema_name filled in after resolution below
     )
     db.add(db_dataset)
 
@@ -230,90 +231,140 @@ async def ingest_upload(
         version=1,
         table_name=dataset_meta["table_name"],
     ))
-
     db.commit()
 
-    # Step 6 — Suggest logical datasets
+    # Step 6 — Extract columns and sample data for schema resolution
     col_dicts = [{"normalized_name": c["normalized_name"], "data_type": c["data_type"]} for c in columns_meta]
-    
-    # Extract sample data for Gemini context
     sample_data = df.head(5).where(pd.notna(df.head(5)), None).to_dict(orient="records")
-    
-    try:
-        suggestions = suggest_logical_dataset(
-            db, 
-            col_dicts, 
-            final_product_id,
-            sample_data=sample_data
-        )
-    except Exception as e:
-        print(f"DEBUG: Failed to suggest logical datasets: {e}")
-        suggestions = []
 
-    # Step 7 — Proactive Auto-Mapping (AI-powered)
+    # Step 7 — Auto-Map: Unified Schema Resolution (Static + Dynamic)
     auto_mapped = False
-    target_ld_id = None
-    target_ld_name = None
+    schema_type = None
+    mapped_schema_name = None
+    mapped_schema_id = None
+    match_confidence = 0.0
+    column_mapping_used = {}
 
-    # Handle explicit logical dataset target
-    if logical_dataset_name:
-        # Find or create LD
-        ld = db.execute(select(LogicalDataset).where(
-            LogicalDataset.product_id == final_product_id,
-            LogicalDataset.dataset_name == logical_dataset_name
-        )).scalars().first()
-        
-        if not ld:
-            # Create it
-            table_name = f"analytics_{str(uuid.uuid4()).replace('-', '_')}"
-            ld = LogicalDataset(
-                product_id=final_product_id,
-                dataset_name=logical_dataset_name,
-                table_name=table_name
-            )
-            db.add(ld)
-            db.commit()
-            db.refresh(ld)
-        
-        target_ld_id = ld.id
-        target_ld_name = ld.dataset_name
-        auto_map = True # Force auto-map if name provided
+    if auto_map or logical_dataset_name:
+        try:
+            from ..services.schema_resolver import resolve_best_schema, SchemaMatch
+            from ..services.materialization import ensure_static_table, ensure_dynamic_table, append_rows
+            
+            # Determine which target to force (if user specified a logical dataset name)
+            forced_ld = None
+            if logical_dataset_name:
+                forced_ld = db.execute(select(LogicalDataset).where(
+                    LogicalDataset.product_id == final_product_id,
+                    LogicalDataset.dataset_name == logical_dataset_name
+                )).scalars().first()
+                if not forced_ld:
+                    analytics_tbl = f"analytics_{str(uuid.uuid4()).replace('-', '_')}"
+                    forced_ld = LogicalDataset(
+                        product_id=final_product_id,
+                        dataset_name=logical_dataset_name,
+                        table_name=analytics_tbl
+                    )
+                    db.add(forced_ld)
+                    db.commit()
+                    db.refresh(forced_ld)
 
-    mapping_result = {}
-    if auto_map:
-        if not target_ld_id and suggestions and suggestions[0]["similarity_score"] > 0.50:
-            target_ld_id = suggestions[0]["logical_dataset_id"]
-            target_ld_name = suggestions[0]["logical_dataset_name"]
-
-        if target_ld_id:
-            try:
-                map_req = MapDatasetRequest(
-                    dataset_id=dataset_meta["id"],
-                    logical_dataset_id=target_ld_id,
-                    auto_map=True
+            if forced_ld:
+                # User explicitly targeted a dynamic schema — skip resolver, use it directly
+                from ..services.similarity import get_logical_schema_columns, generate_suggested_mapping
+                ld_cols = get_logical_schema_columns(db, forced_ld.id)
+                if ld_cols:
+                    col_mapping = generate_suggested_mapping(
+                        [c["normalized_name"] for c in col_dicts],
+                        ld_cols,
+                        sample_data=sample_data
+                    )
+                else:
+                    col_mapping = {c["normalized_name"]: c["normalized_name"] for c in col_dicts}
+                
+                match = SchemaMatch(
+                    schema_type="dynamic",
+                    logical_dataset_id=forced_ld.id,
+                    schema_name=forced_ld.dataset_name,
+                    confidence=1.0,
+                    column_mapping=col_mapping,
+                    analytics_table=forced_ld.table_name,
+                    reason="User-specified target schema"
                 )
-                mapping_result = perform_mapping(map_req, db)
+            else:
+                # Unified AI resolution across all schemas
+                match = resolve_best_schema(
+                    db=db,
+                    source_columns=col_dicts,
+                    sample_data=sample_data,
+                    product_id=final_product_id,
+                )
+
+            if match.schema_type != "none" and match.column_mapping:
+                source_cols_for_mat = [
+                    {"normalized_name": c["normalized_name"], "pg_type": pg_type(c["data_type"])}
+                    for c in columns_meta
+                ]
+
+                if match.schema_type == "static":
+                    ensure_static_table(engine, match.analytics_table, match.column_mapping, source_cols_for_mat)
+                else:
+                    ensure_dynamic_table(engine, match.analytics_table, match.column_mapping, source_cols_for_mat)
+
+                append_rows(engine, match.analytics_table, dataset_meta["table_name"], match.column_mapping, dataset_meta["id"])
+
+                # Record the mapping
+                ld_for_record = None
+                if match.schema_type == "dynamic":
+                    ld_for_record = db.execute(select(LogicalDataset).where(
+                        LogicalDataset.id == match.logical_dataset_id
+                    )).scalars().first()
+                    if ld_for_record:
+                        db.add(LogicalDatasetMapping(
+                            logical_dataset_id=ld_for_record.id,
+                            dataset_id=dataset_meta["id"],
+                            column_mapping=match.column_mapping,
+                        ))
+                        db.commit()
+
                 auto_mapped = True
-            except Exception as e:
-                print(f"DEBUG: Auto-mapping failed: {e}")
+                schema_type = match.schema_type
+                mapped_schema_name = match.schema_name
+                mapped_schema_id = match.schema_id or match.logical_dataset_id
+                match_confidence = match.confidence
+                column_mapping_used = match.column_mapping
+                # Persist schema_type on the dataset record for future queries
+                db_dataset.schema_type = schema_type
+                db_dataset.mapped_schema_name = mapped_schema_name
+                db.add(db_dataset)
+                db.commit()
+                print(f"DEBUG: Auto-mapped to {schema_type} schema '{mapped_schema_name}' (confidence={match_confidence:.2f})")
+
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"DEBUG: Auto-mapping failed: {e}")
+
+    # Step 8 — Build suggestions for informational response
+    try:
+        suggestions = suggest_logical_dataset(db, col_dicts, final_product_id, sample_data=sample_data)
+    except Exception:
+        suggestions = []
 
     res_data = {
         "dataset_id": dataset_meta["id"],
         "table_name": dataset_meta["table_name"],
         "rows": rows_inserted,
-        "columns": [
-            {
-                "name": c["normalized_name"],
-                "type": c["data_type"],
-            }
-            for c in columns_meta
-        ],
+        "columns": [{"name": c["normalized_name"], "type": c["data_type"]} for c in columns_meta],
         "status": "success",
         "file_name": file.filename,
-        "logical_dataset_suggestions": suggestions,
         "auto_mapped": auto_mapped,
-        "mapped_to": target_ld_name if auto_mapped else None,
-        **mapping_result
+        "schema_type": schema_type,
+        "mapped_to": mapped_schema_name,
+        "mapped_schema_id": mapped_schema_id,
+        "match_confidence": match_confidence,
+        "column_mapping": column_mapping_used,
+        "logical_dataset_suggestions": suggestions,
     }
 
     return sanitize_nans(res_data)
@@ -388,50 +439,106 @@ async def ingest_upload_bulk(
             except:
                 suggestions = []
 
-            # Step 7 — Proactive Auto-Mapping
+            # Step 7 — Auto-Map: Unified Schema Resolution (Static + Dynamic)
             auto_mapped = False
-            target_ld_id = None
-            target_ld_name = None
+            schema_type = None
+            mapped_schema_name = None
+            mapped_schema_id = None
+            match_confidence = 0.0
+            column_mapping_used = {}
 
-            if logical_dataset_name:
-                ld = db.execute(select(LogicalDataset).where(
-                    LogicalDataset.product_id == product_id,
-                    LogicalDataset.dataset_name == logical_dataset_name
-                )).scalars().first()
-                if not ld:
-                    table_name = f"analytics_{str(uuid.uuid4()).replace('-', '_')}"
-                    ld = LogicalDataset(
-                        product_id=product_id,
-                        dataset_name=logical_dataset_name,
-                        table_name=table_name
-                    )
-                    db.add(ld)
-                    db.commit()
-                    db.refresh(ld)
-                target_ld_id = ld.id
-                target_ld_name = ld.dataset_name
-                # We need to enforce auto_map locally here if the user intended to map
-                local_auto_map = True
-            else:
-                local_auto_map = auto_map
+            if auto_map or logical_dataset_name:
+                try:
+                    from ..services.schema_resolver import resolve_best_schema, SchemaMatch
+                    from ..services.materialization import ensure_static_table, ensure_dynamic_table, append_rows
 
-            mapping_result = {}
-            if local_auto_map:
-                if not target_ld_id and suggestions and suggestions[0]["similarity_score"] > 0.50:
-                    target_ld_id = suggestions[0]["logical_dataset_id"]
-                    target_ld_name = suggestions[0]["logical_dataset_name"]
+                    forced_ld = None
+                    if logical_dataset_name:
+                        forced_ld = db.execute(select(LogicalDataset).where(
+                            LogicalDataset.product_id == product_id,
+                            LogicalDataset.dataset_name == logical_dataset_name
+                        )).scalars().first()
+                        if not forced_ld:
+                            analytics_tbl = f"analytics_{str(uuid.uuid4()).replace('-', '_')}"
+                            forced_ld = LogicalDataset(
+                                product_id=product_id,
+                                dataset_name=logical_dataset_name,
+                                table_name=analytics_tbl
+                            )
+                            db.add(forced_ld)
+                            db.commit()
+                            db.refresh(forced_ld)
 
-                if target_ld_id:
-                    try:
-                        map_req = MapDatasetRequest(
-                            dataset_id=dataset_meta["id"],
-                            logical_dataset_id=target_ld_id,
-                            auto_map=True
+                    if forced_ld:
+                        from ..services.similarity import get_logical_schema_columns, generate_suggested_mapping
+                        ld_cols = get_logical_schema_columns(db, forced_ld.id)
+                        if ld_cols:
+                            col_mapping = generate_suggested_mapping(
+                                [c["normalized_name"] for c in col_dicts],
+                                ld_cols,
+                                sample_data=sample_data
+                            )
+                        else:
+                            col_mapping = {c["normalized_name"]: c["normalized_name"] for c in col_dicts}
+
+                        match = SchemaMatch(
+                            schema_type="dynamic",
+                            logical_dataset_id=forced_ld.id,
+                            schema_name=forced_ld.dataset_name,
+                            confidence=1.0,
+                            column_mapping=col_mapping,
+                            analytics_table=forced_ld.table_name,
+                            reason="User-specified target schema"
                         )
-                        mapping_result = perform_mapping(map_req, db)
+                    else:
+                        match = resolve_best_schema(
+                            db=db,
+                            source_columns=col_dicts,
+                            sample_data=sample_data,
+                            product_id=product_id,
+                        )
+
+                    if match.schema_type != "none" and match.column_mapping:
+                        source_cols_for_mat = [
+                            {"normalized_name": c["normalized_name"], "pg_type": pg_type(c["data_type"])}
+                            for c in columns_meta
+                        ]
+
+                        if match.schema_type == "static":
+                            ensure_static_table(engine, match.analytics_table, match.column_mapping, source_cols_for_mat)
+                        else:
+                            ensure_dynamic_table(engine, match.analytics_table, match.column_mapping, source_cols_for_mat)
+
+                        append_rows(engine, match.analytics_table, dataset_meta["table_name"], match.column_mapping, dataset_meta["id"])
+
+                        if match.schema_type == "dynamic":
+                            ld_for_record = db.execute(select(LogicalDataset).where(
+                                LogicalDataset.id == match.logical_dataset_id
+                            )).scalars().first()
+                            if ld_for_record:
+                                db.add(LogicalDatasetMapping(
+                                    logical_dataset_id=ld_for_record.id,
+                                    dataset_id=dataset_meta["id"],
+                                    column_mapping=match.column_mapping,
+                                ))
+                                db.commit()
+
                         auto_mapped = True
-                    except Exception as e:
-                        print(f"DEBUG: Bulk auto-mapping failed: {e}")
+                        schema_type = match.schema_type
+                        mapped_schema_name = match.schema_name
+                        mapped_schema_id = match.schema_id or match.logical_dataset_id
+                        match_confidence = match.confidence
+                        column_mapping_used = match.column_mapping
+
+                        db_dataset.schema_type = schema_type
+                        db_dataset.mapped_schema_name = mapped_schema_name
+                        db.add(db_dataset)
+                        db.commit()
+
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"DEBUG: Bulk auto-mapping failed: {e}")
 
             res_data = {
                 "dataset_id": dataset_meta["id"],
@@ -440,10 +547,13 @@ async def ingest_upload_bulk(
                 "columns": [{"name": c["normalized_name"], "type": c["data_type"]} for c in columns_meta],
                 "status": "success",
                 "file_name": f.filename,
-                "logical_dataset_suggestions": suggestions,
                 "auto_mapped": auto_mapped,
-                "mapped_to": target_ld_name if auto_mapped else None,
-                **mapping_result
+                "schema_type": schema_type,
+                "mapped_to": mapped_schema_name,
+                "mapped_schema_id": mapped_schema_id,
+                "match_confidence": match_confidence,
+                "column_mapping": column_mapping_used,
+                "logical_dataset_suggestions": suggestions,
             }
             results.append(sanitize_nans(res_data))
 
@@ -463,16 +573,34 @@ def list_datasets(product_id: str, db: Session = Depends(get_db)):
         select(Dataset).where(Dataset.product_id == product_id).order_by(Dataset.created_at.desc())
     ).scalars().all()
 
-    return [
-        {
-            "dataset_id": d.id,
-            "file_name": d.file_name,
+    results = []
+    for d in datasets:
+        # Get column names
+        cols = db.execute(select(DatasetColumn.normalized_name).where(DatasetColumn.dataset_id == d.id)).scalars().all()
+        
+        # Get logical mapping
+        mapping = db.execute(select(LogicalDatasetMapping).where(LogicalDatasetMapping.dataset_id == d.id)).scalars().first()
+        ld_name = None
+        ld_id = None
+        if mapping:
+            ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == mapping.logical_dataset_id)).scalars().first()
+            if ld:
+                ld_name = ld.dataset_name
+                ld_id = ld.id
+
+        results.append({
+            "id": d.id,
+            "original_filename": d.file_name,
             "table_name": d.table_name,
             "row_count": d.row_count,
             "created_at": d.created_at,
-        }
-        for d in datasets
-    ]
+            "columns": list(cols),
+            "logical_dataset_id": ld_id,
+            "logical_dataset_name": ld_name or d.mapped_schema_name,
+            "schema_type": d.schema_type,
+        })
+
+    return results
 
 
 @router.get("/datasets/{dataset_id}")
@@ -487,9 +615,9 @@ def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
     ).scalars().all()
 
     return {
-        "dataset_id": dataset.id,
+        "id": dataset.id,
         "product_id": dataset.product_id,
-        "file_name": dataset.file_name,
+        "original_filename": dataset.file_name,
         "table_name": dataset.table_name,
         "row_count": dataset.row_count,
         "created_at": dataset.created_at,
@@ -554,7 +682,7 @@ def create_logical_dataset(req: CreateLogicalDatasetRequest, db: Session = Depen
     db.commit()
     db.refresh(ld)
 
-    return {"logical_dataset_id": ld.id, "dataset_name": ld.dataset_name, "table_name": ld.table_name}
+    return {"id": ld.id, "dataset_name": ld.dataset_name, "table_name": ld.table_name, "created_at": ld.created_at}
 
 
 @router.get("/logical-datasets")
@@ -564,15 +692,36 @@ def list_logical_datasets(product_id: str, db: Session = Depends(get_db)):
         select(LogicalDataset).where(LogicalDataset.product_id == product_id)
     ).scalars().all()
     return [
-        {"logical_dataset_id": ld.id, "dataset_name": ld.dataset_name, "description": ld.description}
+        {"id": ld.id, "dataset_name": ld.dataset_name, "table_name": ld.table_name, "description": ld.description, "created_at": ld.created_at}
         for ld in lds
     ]
+
+
+@router.delete("/logical-datasets/{logical_dataset_id}")
+def delete_logical_dataset(logical_dataset_id: str, db: Session = Depends(get_db)):
+    """Delete a logical dataset and its associated analytics table."""
+    ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)).scalars().first()
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found")
+
+    # Drop the analytics table if it exists
+    analytics_table = f"analytics_{logical_dataset_id}"
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f'DROP TABLE IF EXISTS "{analytics_table}"'))
+            conn.commit()
+    except Exception as e:
+        print(f"WARNING: Could not drop analytics table {analytics_table}: {e}")
+
+    db.delete(ld)
+    db.commit()
+    return {"message": f"Logical dataset '{ld.dataset_name}' deleted successfully"}
 
 
 @router.post("/dataset/map")
 def map_dataset_to_logical(
     dataset_id: str = Form(...),
-    logical_dataset_id: str = Form(...),
+    logical_dataset_id: Optional[str] = Form(None),
     auto_map: bool = Form(False),
     column_mapping: Optional[str] = Form(None),
     db: Session = Depends(get_db)
@@ -589,9 +738,32 @@ def map_dataset_to_logical(
         except Exception:
             raise HTTPException(status_code=400, detail="column_mapping must be a valid JSON string")
 
+    final_logical_dataset_id = logical_dataset_id
+    if not final_logical_dataset_id and auto_map:
+        dataset = db.execute(select(Dataset).where(Dataset.id == dataset_id)).scalars().first()
+        if not dataset:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        
+        cols = db.execute(select(DatasetColumn).where(DatasetColumn.dataset_id == dataset_id)).scalars().all()
+        col_dicts = [{"normalized_name": c.normalized_name, "data_type": c.data_type} for c in cols]
+        
+        # We need product_id for similarity search
+        try:
+            suggestions = suggest_logical_dataset(db, col_dicts, dataset.product_id)
+            if suggestions and suggestions[0]["similarity_score"] > 0.50:
+                final_logical_dataset_id = suggestions[0]["logical_dataset_id"]
+        except Exception as e:
+            print(f"DEBUG: Dataset auto-map suggest logic failed: {e}")
+
+    if not final_logical_dataset_id:
+        raise HTTPException(
+            status_code=400, 
+            detail="logical_dataset_id is required, or AI Auto-Map must confidently detect a matching schema target."
+        )
+
     req = MapDatasetRequest(
         dataset_id=dataset_id,
-        logical_dataset_id=logical_dataset_id,
+        logical_dataset_id=final_logical_dataset_id,
         auto_map=auto_map,
         column_mapping=parsed_mapping
     )

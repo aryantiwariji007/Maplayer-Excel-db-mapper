@@ -116,6 +116,8 @@ def infer_schema(df: pd.DataFrame, product_id: str, file_name: str) -> dict:
 
     for raw_col in df.columns:
         norm = normalize_column_name(raw_col)
+        # Postgres limits identifiers to 63 bytes. We truncate to 55 to leave room for the deduplication suffix.
+        norm = norm[:55]
 
         # Deduplicate: if two columns normalize to the same name, append a counter
         if norm in seen_normalized:

@@ -82,10 +82,13 @@ class Dataset(Base):
     file_name = Column(String, nullable=False)
     table_name = Column(String, nullable=False, unique=True)  # e.g. upload_<uuid>
     row_count = Column(Integer, default=0)
+    schema_type = Column(String, nullable=True)       # "static" | "dynamic" | None
+    mapped_schema_name = Column(String, nullable=True)  # name of the matched schema
     created_at = Column(DateTime, server_default=func.now())
 
     columns = relationship("DatasetColumn", back_populates="dataset", cascade="all, delete-orphan")
     versions = relationship("DatasetVersion", back_populates="dataset", cascade="all, delete-orphan")
+
 
 
 class DatasetColumn(Base):

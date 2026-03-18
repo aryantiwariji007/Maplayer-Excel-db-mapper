@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 POSTGRES_USER = os.getenv("POSTGRES_USER", "maplayer")
@@ -24,3 +24,40 @@ def get_db():
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _apply_migrations()
+
+def _apply_migrations():
+    """Apply safe, idempotent ALTER TABLE migrations for schema evolution."""
+    migrations = [
+        # Add schema_type to datasets (string: "static" | "dynamic")
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='datasets' AND column_name='schema_type'
+            ) THEN
+                ALTER TABLE datasets ADD COLUMN schema_type VARCHAR;
+            END IF;
+        END $$;
+        """,
+        # Add mapped_schema_name to datasets
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='datasets' AND column_name='mapped_schema_name'
+            ) THEN
+                ALTER TABLE datasets ADD COLUMN mapped_schema_name VARCHAR;
+            END IF;
+        END $$;
+        """,
+    ]
+    try:
+        with engine.connect() as conn:
+            for sql in migrations:
+                conn.execute(text(sql))
+            conn.commit()
+        print("DEBUG: Database migrations applied successfully.")
+    except Exception as e:
+        print(f"WARNING: Migration step failed (non-fatal): {e}")
+

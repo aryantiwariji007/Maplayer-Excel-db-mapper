@@ -171,7 +171,7 @@ def list_metrics(product_id: str, db: Session = Depends(get_db)):
     metrics = db.execute(select(Metric).where(Metric.product_id == product_id)).scalars().all()
     return [
         {
-            "metric_id": m.id,
+            "id": m.id,
             "metric_name": m.metric_name,
             "logical_dataset_id": m.logical_dataset_id,
             "sql_expression": m.sql_expression,

@@ -124,21 +124,23 @@ def create_analytics_table(engine: Engine, table_name: str, mapping: dict, sourc
     `source_columns` is the list of column dicts from the first mapped dataset.
     """
     col_defs = []
-    source_type_map = {c["column_name"]: c["pg_type"] for c in source_columns}
+    source_type_map = {c.get("column_name", c.get("normalized_name", "")): c.get("pg_type", "TEXT") for c in source_columns}
     # Also support mapping by normalized_name if that's what is passed
-    source_type_map.update({c["normalized_name"]: c["pg_type"] for c in source_columns})
+    source_type_map.update({c.get("normalized_name", ""): c.get("pg_type", "TEXT") for c in source_columns})
     
     for source_col, target_col in mapping.items():
         pg_type = source_type_map.get(source_col, "TEXT")
         col_defs.append(f'"{target_col}" {pg_type}')
     
-    col_defs_str = ",\n        ".join(col_defs)
+    if col_defs:
+        col_defs_str = ",\n        " + ",\n        ".join(col_defs)
+    else:
+        col_defs_str = ""
     
     ddl = f"""
     CREATE TABLE IF NOT EXISTS "{table_name}" (
         _analytics_id SERIAL PRIMARY KEY,
-        dataset_id VARCHAR(255) NOT NULL,
-        {col_defs_str}
+        dataset_id VARCHAR(255) NOT NULL{col_defs_str}
     );
     """
     with engine.connect() as conn:
@@ -190,12 +192,16 @@ def append_to_analytics_table(
             
         target_cols.append(f'"{tgt}"')
         
-    source_expr_str = ", ".join(source_cols_exprs)
-    target_cols_str = ", ".join(target_cols)
+    if target_cols:
+        target_cols_str = ", " + ", ".join(target_cols)
+        source_expr_str = ", " + ", ".join(source_cols_exprs)
+    else:
+        target_cols_str = ""
+        source_expr_str = ""
     
     sql = f"""
-    INSERT INTO "{analytics_table}" (dataset_id, {target_cols_str})
-    SELECT '{dataset_id}', {source_expr_str}
+    INSERT INTO "{analytics_table}" (dataset_id{target_cols_str})
+    SELECT '{dataset_id}'{source_expr_str}
     FROM "{source_table}";
     """
     try:
