@@ -12,10 +12,11 @@ export interface TargetColumn {
 }
 
 export interface TargetSchemaResponse {
-  id: number;
-  product_id: string;
+  id: string | number;
+  product_id?: string;
   schema_name: string;
-  created_at: string;
+  schema_type?: "static" | "dynamic";
+  created_at?: string;
   columns: TargetColumn[];
 }
 
@@ -125,13 +126,65 @@ export interface BulkSaveMetricsRequest {
 }
 
 // ---- App State ----
+export interface ComposeDraft {
+  viewName: string;
+  description: string;
+  sources: Omit<CompositeViewSource, "id" | "composite_view_id">[];
+}
+
+export interface MappingDraft {
+  selectedDatasetId: string | null;
+  selectedSchemaId: string | null;
+  columnMappings: Record<string, string>;
+}
+
 export interface AppStore {
   productId: string;
   setProductId: (id: string) => void;
+  // Drafts
+  composeDraft: ComposeDraft;
+  setComposeDraft: (draft: Partial<ComposeDraft>) => void;
+  resetComposeDraft: () => void;
+  
+  mappingDraft: MappingDraft;
+  setMappingDraft: (draft: Partial<MappingDraft>) => void;
+  resetMappingDraft: () => void;
 }
 
 // ---- Preview ----
 export interface PreviewData {
   columns: string[];
   rows: Record<string, unknown>[];
+}
+
+// ---- Mapping History ----
+export interface MappingHistoryRecord {
+  version: number;
+  logical_dataset_id: string;
+  logical_dataset_name: string;
+  column_mapping: Record<string, string>;
+  created_at: string;
+  updated_at?: string;
+  superseded_at?: string;
+  status: "current" | "archived";
+}
+
+// ---- Composite Views ----
+export interface CompositeViewSource {
+  id?: number;
+  composite_view_id?: string;
+  dataset_type: "static" | "dynamic";
+  dataset_id: string;
+  dataset_name?: string;
+  join_key: string;
+  alias: string;
+}
+
+export interface CompositeView {
+  id: string;
+  product_id: string;
+  view_name: string;
+  description?: string;
+  sources: CompositeViewSource[];
+  created_at?: string;
 }

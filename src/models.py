@@ -3,6 +3,7 @@ from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, U
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from .database import Base
+import datetime
 
 def generate_uuid():
     return str(uuid.uuid4())
@@ -130,9 +131,24 @@ class LogicalDatasetMapping(Base):
     logical_dataset_id = Column(String, ForeignKey("logical_datasets.id", ondelete="CASCADE"), nullable=False)
     dataset_id = Column(String, ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False)
     column_mapping = Column(JSONB, nullable=False, default=dict)  # {"source_col": "logical_col"}
+    version = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     logical_dataset = relationship("LogicalDataset", back_populates="mappings")
+
+
+class MappingHistory(Base):
+    """Archived snapshots of LogicalDatasetMapping — written before each overwrite."""
+    __tablename__ = "mapping_history"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dataset_id = Column(String, ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False)
+    logical_dataset_id = Column(String, nullable=False)
+    column_mapping = Column(JSONB, nullable=False, default=dict)
+    version = Column(Integer, nullable=False, default=1)
+    superseded_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class DatasetVersion(Base):
