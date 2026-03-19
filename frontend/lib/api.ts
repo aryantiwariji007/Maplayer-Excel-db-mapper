@@ -15,6 +15,8 @@ import type {
   DiscoveredMetric,
   BulkSaveMetricsRequest,
   PreviewData,
+  MappingHistoryRecord,
+  CompositeView,
 } from "@/types";
 
 const api = axios.create({
@@ -105,6 +107,11 @@ export const ingestApi = {
       .get("/ingest/logical-datasets", { params: { product_id: productId } })
       .then((r) => r.data),
 
+  listAllSchemas: (productId: string): Promise<TargetSchemaResponse[]> =>
+    api
+      .get("/ingest/all-schemas", { params: { product_id: productId } })
+      .then((r) => r.data),
+
   mapDatasetToLogical: (
     datasetId: string,
     logicalDatasetId?: string,
@@ -119,6 +126,40 @@ export const ingestApi = {
       form.append("column_mapping", JSON.stringify(columnMapping));
     return api.post("/ingest/dataset/map", form).then((r) => r.data);
   },
+
+  mappingHistory: (datasetId: string): Promise<MappingHistoryRecord[]> =>
+    api.get(`/ingest/datasets/${datasetId}/mapping-history`).then((r) => r.data),
+
+  previewRemapped: (datasetId: string, mode: "full" | "mapped_only" = "full"): Promise<{ columns: string[]; rows: Record<string, unknown>[] }> =>
+    api.get(`/ingest/datasets/${datasetId}/preview-remapped`, { params: { mode } }).then((r) => r.data),
+
+  listSourceFiles: (logicalDatasetId: string): Promise<{
+    dataset_id: string;
+    file_name: string;
+    row_count: number;
+    column_mapping: Record<string, string>;
+    mapped_at: string;
+  }[]> =>
+    api.get(`/ingest/logical-datasets/${logicalDatasetId}/source-files`).then((r) => r.data),
+};
+
+export const compositeApi = {
+  list: (productId: string): Promise<CompositeView[]> =>
+    api.get("/composite/views", { params: { product_id: productId } }).then((r) => r.data),
+
+  create: (data: {
+    product_id: string;
+    view_name: string;
+    description?: string;
+    sources: { dataset_type: string; dataset_id: string; join_key: string; alias: string }[];
+  }): Promise<CompositeView> =>
+    api.post("/composite/views", data).then((r) => r.data),
+
+  query: (viewId: string, limit = 200): Promise<{ columns: string[]; rows: Record<string, unknown>[] }> =>
+    api.get(`/composite/views/${viewId}/query`, { params: { limit } }).then((r) => r.data),
+
+  delete: (viewId: string): Promise<{ message: string }> =>
+    api.delete(`/composite/views/${viewId}`).then((r) => r.data),
 };
 
 // =============================

@@ -112,19 +112,20 @@ def infer_schema(df: pd.DataFrame, product_id: str, file_name: str) -> dict:
     table_name = f"upload_{dataset_id.replace('-', '_')}"
 
     columns = []
-    seen_normalized: dict[str, int] = {}
+    used_names: set[str] = set()
 
     for raw_col in df.columns:
-        norm = normalize_column_name(raw_col)
+        base_norm = normalize_column_name(raw_col)
         # Postgres limits identifiers to 63 bytes. We truncate to 55 to leave room for the deduplication suffix.
-        norm = norm[:55]
-
-        # Deduplicate: if two columns normalize to the same name, append a counter
-        if norm in seen_normalized:
-            seen_normalized[norm] += 1
-            norm = f"{norm}_{seen_normalized[norm]}"
-        else:
-            seen_normalized[norm] = 0
+        base_norm = base_norm[:55]
+        
+        norm = base_norm
+        counter = 1
+        while norm in used_names:
+            norm = f"{base_norm}_{counter}"
+            counter += 1
+        
+        used_names.add(norm)
 
         dtype = infer_column_type(df[raw_col])
         columns.append({

@@ -8,6 +8,7 @@ import {
   BarChart3,
   Layers,
   Zap,
+  Link2,
 } from "lucide-react";
 
 const navItems = [
@@ -15,6 +16,7 @@ const navItems = [
   { href: "/mapping", label: "Mapping", icon: GitBranch, desc: "Map columns" },
   { href: "/preview", label: "Preview", icon: Eye, desc: "Inspect data" },
   { href: "/analytics", label: "Analytics", icon: BarChart3, desc: "Query & metrics" },
+  { href: "/compose", label: "Compose", icon: Link2, desc: "Cross-dataset views" },
 ];
 
 export default function Sidebar() {

@@ -28,6 +28,8 @@ from ..models import (
     DatasetVersion,
     LogicalDataset,
     LogicalDatasetMapping,
+    TargetSchema,
+    TargetColumn,
 )
 from ..services.data_processor import load_dataframe
 from ..services.schema_inference import infer_schema
@@ -88,12 +90,52 @@ def perform_mapping(req: MapDatasetRequest, db: Session):
             raise Exception("Auto-map failed to identify any matching columns between the source file and logical schema. Please provide a manual column_mapping.")
         raise Exception("Column mapping is required")
 
-    mapping = LogicalDatasetMapping(
-        logical_dataset_id=req.logical_dataset_id,
-        dataset_id=req.dataset_id,
-        column_mapping=req.column_mapping,
-    )
-    db.add(mapping)
+    # Filter out empty/skipped target keys to prevent SQL syntax errors ("" TEXT)
+    req.column_mapping = {
+        src: tgt for src, tgt in req.column_mapping.items() 
+        if tgt and tgt.strip() and tgt != "- skip -"
+    }
+    
+    if not req.column_mapping:
+        raise Exception("No valid columns selected for mapping. Please map at least one column.")
+
+    existing_mapping = db.execute(
+        select(LogicalDatasetMapping).where(LogicalDatasetMapping.dataset_id == req.dataset_id)
+    ).scalars().first()
+    
+    if existing_mapping:
+        # Archive old mapping to history before overwriting
+        from ..models import MappingHistory
+        import datetime
+        history_record = MappingHistory(
+            dataset_id=existing_mapping.dataset_id,
+            logical_dataset_id=existing_mapping.logical_dataset_id,
+            column_mapping=existing_mapping.column_mapping,
+            version=existing_mapping.version,
+            superseded_at=datetime.datetime.utcnow(),
+        )
+        db.add(history_record)
+        
+        # Delete old rows from existing analytics table
+        old_ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == existing_mapping.logical_dataset_id)).scalars().first()
+        if old_ld:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f'DELETE FROM "{old_ld.table_name}" WHERE dataset_id = :did'), {"did": req.dataset_id})
+            except Exception as e:
+                print(f"DEBUG: Failed to delete old mapped rows: {e}")
+                
+        existing_mapping.logical_dataset_id = req.logical_dataset_id
+        existing_mapping.column_mapping = req.column_mapping
+        existing_mapping.version = (existing_mapping.version or 1) + 1
+    else:
+        mapping = LogicalDatasetMapping(
+            logical_dataset_id=req.logical_dataset_id,
+            dataset_id=req.dataset_id,
+            column_mapping=req.column_mapping,
+            version=1,
+        )
+        db.add(mapping)
     
     # ── Materialize into Analytics Table ──
     cols = db.execute(
@@ -110,18 +152,28 @@ def perform_mapping(req: MapDatasetRequest, db: Session):
     ]
 
     try:
-        existing_cols = get_table_columns(engine, ld.table_name)
+        from ..services.dataset_store import get_table_schema_dict, promote_column_type
+        existing_cols_dict = get_table_schema_dict(engine, ld.table_name)
         new_cols_to_add = {}
         # Simple type map construction for the evolution check
         type_map = {c.normalized_name: pg_type(c.data_type) for c in cols}
         
         for source_col, target_col in req.column_mapping.items():
-            if target_col not in existing_cols:
-                new_cols_to_add[target_col] = type_map.get(source_col, "TEXT")
+            source_pg_type = type_map.get(source_col, "TEXT")
+            
+            if target_col not in existing_cols_dict:
+                new_cols_to_add[target_col] = source_pg_type
+            else:
+                target_pg_type = existing_cols_dict[target_col].upper()
+                # Type Promotion: If source is TEXT but target is restrictive, promote to TEXT
+                if source_pg_type == "TEXT" and "TEXT" not in target_pg_type and "VARCHAR" not in target_pg_type:
+                    promote_column_type(engine, ld.table_name, target_col, "TEXT")
+                    print(f"DEBUG: Promoted target column '{target_col}' in '{ld.table_name}' from {target_pg_type} to TEXT.")
         
         if new_cols_to_add:
             add_columns_to_analytics_table(engine, ld.table_name, new_cols_to_add)
-    except Exception:
+    except Exception as e:
+        print(f"DEBUG: Analytics evolution failed or table missing: {e}. Attempting full create.")
         create_analytics_table(engine, ld.table_name, req.column_mapping, source_columns)
     
     append_to_analytics_table(engine, ld.table_name, dataset.table_name, req.column_mapping, req.dataset_id)
@@ -133,6 +185,7 @@ def perform_mapping(req: MapDatasetRequest, db: Session):
     
     result = {
         "detected_schema": ld.dataset_name,
+        "logical_dataset_id": ld.id,
         "mappings_used": len(req.column_mapping),
         "target_to_source_map": inverted_map,
         "sample_input_records": [],
@@ -697,6 +750,170 @@ def list_logical_datasets(product_id: str, db: Session = Depends(get_db)):
     ]
 
 
+@router.get("/logical-datasets/{logical_dataset_id}/source-files")
+def list_logical_dataset_source_files(logical_dataset_id: str, db: Session = Depends(get_db)):
+    """
+    List all physical source files (datasets) that have been mapped into a logical dataset.
+    Returns each file with its id, filename, row_count and the column_mapping applied.
+    """
+    ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)).scalars().first()
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found")
+
+    mappings = db.execute(
+        select(LogicalDatasetMapping).where(LogicalDatasetMapping.logical_dataset_id == logical_dataset_id)
+    ).scalars().all()
+
+    results = []
+    for m in mappings:
+        ds = db.execute(select(Dataset).where(Dataset.id == m.dataset_id)).scalars().first()
+        if ds:
+            results.append({
+                "dataset_id": ds.id,
+                "file_name": ds.file_name,
+                "row_count": ds.row_count,
+                "column_mapping": m.column_mapping,  # {source_col: schema_key}
+                "mapped_at": m.created_at,
+            })
+
+    return results
+
+
+@router.get("/all-schemas")
+def list_all_schemas(product_id: str, db: Session = Depends(get_db)):
+    """List all schemas (static and dynamic) for a product in a unified format."""
+    static_schemas = db.execute(select(TargetSchema).where(TargetSchema.product_id == product_id)).scalars().unique().all()
+    dynamic_schemas = db.execute(select(LogicalDataset).where(LogicalDataset.product_id == product_id)).scalars().all()
+    
+    results = []
+    
+    for s in static_schemas:
+        results.append({
+            "id": s.id,
+            "schema_name": s.schema_name,
+            "schema_type": "static",
+            "description": s.description,
+            "columns": [{"key": c.key, "data_type": c.data_type, "required": c.required, "description": c.description} for c in s.columns],
+        })
+        
+    for d in dynamic_schemas:
+        # Get columns from mapping
+        from ..services.similarity import get_logical_schema_columns
+        cols = get_logical_schema_columns(db, d.id)
+        results.append({
+            "id": d.id,
+            "schema_name": d.dataset_name,
+            "schema_type": "dynamic",
+            "description": d.description,
+            "columns": [{"key": c, "data_type": "text", "required": False, "description": ""} for c in cols],
+        })
+        
+    return results
+
+
+@router.get("/datasets/{dataset_id}/mapping-history")
+def get_mapping_history(dataset_id: str, db: Session = Depends(get_db)):
+    """Return all past mapping versions for a dataset, newest first."""
+    from ..models import MappingHistory
+    current = db.execute(
+        select(LogicalDatasetMapping).where(LogicalDatasetMapping.dataset_id == dataset_id)
+    ).scalars().first()
+    
+    history = db.execute(
+        select(MappingHistory).where(MappingHistory.dataset_id == dataset_id).order_by(MappingHistory.version.desc())
+    ).scalars().all()
+    
+    records = []
+    if current:
+        ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == current.logical_dataset_id)).scalars().first()
+        records.append({
+            "version": current.version,
+            "logical_dataset_id": current.logical_dataset_id,
+            "logical_dataset_name": ld.dataset_name if ld else "Unknown",
+            "column_mapping": current.column_mapping,
+            "created_at": current.created_at,
+            "updated_at": current.updated_at,
+            "status": "current",
+        })
+    
+    for h in history:
+        ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == h.logical_dataset_id)).scalars().first()
+        records.append({
+            "version": h.version,
+            "logical_dataset_id": h.logical_dataset_id,
+            "logical_dataset_name": ld.dataset_name if ld else "Unknown",
+            "column_mapping": h.column_mapping,
+            "created_at": h.created_at,
+            "superseded_at": h.superseded_at,
+            "status": "archived",
+        })
+    
+    return records
+
+
+@router.get("/datasets/{dataset_id}/preview-remapped")
+def preview_dataset_remapped(dataset_id: str, mode: str = "full", db: Session = Depends(get_db)):
+    """
+    Return a raw dataset preview with column names remapped to target schema keys.
+    Modes:
+      - 'full': original columns + renamed mapped columns
+      - 'mapped_only': only the columns that were mapped
+    """
+    dataset = db.execute(select(Dataset).where(Dataset.id == dataset_id)).scalars().first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    
+    mapping_rec = db.execute(
+        select(LogicalDatasetMapping).where(LogicalDatasetMapping.dataset_id == dataset_id)
+    ).scalars().first()
+    
+    raw = query_dataset(engine, f'SELECT * FROM "{dataset.table_name}" LIMIT 200')
+    
+    if not mapping_rec:
+        return sanitize_nans(raw)
+    
+    col_map = mapping_rec.column_mapping  # {source_normalized -> target_key}
+    
+    if mode == "mapped_only":
+        remapped_columns = []
+        for c in raw["columns"]:
+            if c in col_map and col_map[c] and col_map[c] != "- skip -":
+                remapped_columns.append(col_map[c])
+                
+        remapped_rows = []
+        for row in raw["rows"]:
+            remapped_row = {}
+            for src_col, val in row.items():
+                if src_col in col_map and col_map[src_col] and col_map[src_col] != "- skip -":
+                    remapped_row[col_map[src_col]] = val
+            remapped_rows.append(remapped_row)
+            
+        return sanitize_nans({"columns": remapped_columns, "rows": remapped_rows})
+
+    else:
+        # Full mode
+        remapped_rows = []
+        for row in raw["rows"]:
+            remapped_row = {}
+            for src_col, val in row.items():
+                target = col_map.get(src_col)
+                if target and target != "- skip -":
+                    remapped_row[target] = val
+                else:
+                    remapped_row[src_col] = val
+            remapped_rows.append(remapped_row)
+        
+        remapped_columns = []
+        for c in raw["columns"]:
+            target = col_map.get(c)
+            if target and target != "- skip -":
+                remapped_columns.append(target)
+            else:
+                remapped_columns.append(c)
+                
+        return sanitize_nans({"columns": remapped_columns, "rows": remapped_rows})
+
+
 @router.delete("/logical-datasets/{logical_dataset_id}")
 def delete_logical_dataset(logical_dataset_id: str, db: Session = Depends(get_db)):
     """Delete a logical dataset and its associated analytics table."""
@@ -728,7 +945,9 @@ def map_dataset_to_logical(
 ):
     """
     Assign a physical dataset to a logical dataset with an explicit or AI-suggested column mapping.
-    Uses Form data for simpler integration.
+    When auto_map=True and no logical_dataset_id is provided, uses the full AI schema resolver
+    (Gemini AI → Qdrant → Fuzzy → Member similarity) to find the best match.
+    If no match is found, auto-creates a new logical dataset from the file's own columns.
     """
     import json
     parsed_mapping = None
@@ -739,6 +958,8 @@ def map_dataset_to_logical(
             raise HTTPException(status_code=400, detail="column_mapping must be a valid JSON string")
 
     final_logical_dataset_id = logical_dataset_id
+    ai_column_mapping = None
+
     if not final_logical_dataset_id and auto_map:
         dataset = db.execute(select(Dataset).where(Dataset.id == dataset_id)).scalars().first()
         if not dataset:
@@ -747,25 +968,102 @@ def map_dataset_to_logical(
         cols = db.execute(select(DatasetColumn).where(DatasetColumn.dataset_id == dataset_id)).scalars().all()
         col_dicts = [{"normalized_name": c.normalized_name, "data_type": c.data_type} for c in cols]
         
-        # We need product_id for similarity search
+        # Fetch sample data from the dataset's table for AI context
+        sample_data = []
         try:
-            suggestions = suggest_logical_dataset(db, col_dicts, dataset.product_id)
-            if suggestions and suggestions[0]["similarity_score"] > 0.50:
-                final_logical_dataset_id = suggestions[0]["logical_dataset_id"]
+            sample_result = query_dataset(engine, f'SELECT * FROM "{dataset.table_name}" LIMIT 5')
+            sample_data = sample_result.get("rows", [])
         except Exception as e:
-            print(f"DEBUG: Dataset auto-map suggest logic failed: {e}")
+            print(f"DEBUG: Could not fetch sample data for AI context: {e}")
+
+        # Use full AI schema resolver (same as the upload endpoint)
+        try:
+            from ..services.schema_resolver import resolve_best_schema, SchemaMatch
+            
+            match = resolve_best_schema(
+                db=db,
+                source_columns=col_dicts,
+                sample_data=sample_data,
+                product_id=dataset.product_id,
+            )
+            
+            if match.schema_type == "dynamic" and match.logical_dataset_id:
+                final_logical_dataset_id = match.logical_dataset_id
+                ai_column_mapping = match.column_mapping
+                print(f"DEBUG: AI Resolver matched dynamic schema '{match.schema_name}' (confidence={match.confidence:.2f})")
+            elif match.schema_type == "static" and match.schema_id:
+                # For static schemas, we still need a logical dataset to map to.
+                # Check if one already exists for this static schema, or create one.
+                from ..models import LogicalDataset as LD
+                existing_ld = db.execute(select(LD).where(
+                    LD.product_id == dataset.product_id,
+                    LD.dataset_name == match.schema_name,
+                )).scalars().first()
+                if existing_ld:
+                    final_logical_dataset_id = existing_ld.id
+                else:
+                    analytics_tbl = f"analytics_{str(uuid.uuid4()).replace('-', '_')}"
+                    new_ld = LogicalDataset(
+                        product_id=dataset.product_id,
+                        dataset_name=match.schema_name,
+                        description=f"Auto-created from static schema: {match.schema_name}",
+                        table_name=analytics_tbl,
+                    )
+                    db.add(new_ld)
+                    db.commit()
+                    db.refresh(new_ld)
+                    final_logical_dataset_id = new_ld.id
+                ai_column_mapping = match.column_mapping
+                print(f"DEBUG: AI Resolver matched static schema '{match.schema_name}' (confidence={match.confidence:.2f})")
+            else:
+                print(f"DEBUG: AI Resolver returned no confident match (type={match.schema_type}). Auto-creating new logical dataset.")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"DEBUG: AI schema resolver failed: {e}")
+
+        # Fallback: auto-create a new logical dataset from the file's own schema
+        if not final_logical_dataset_id:
+            import os
+            base_name = os.path.splitext(dataset.file_name)[0].lower().replace(" ", "_").replace("-", "_")
+            auto_name = f"{base_name}_dataset"
+            
+            # Check if it already exists
+            existing = db.execute(select(LogicalDataset).where(
+                LogicalDataset.product_id == dataset.product_id,
+                LogicalDataset.dataset_name == auto_name,
+            )).scalars().first()
+            
+            if existing:
+                final_logical_dataset_id = existing.id
+            else:
+                analytics_tbl = f"analytics_{str(uuid.uuid4()).replace('-', '_')}"
+                new_ld = LogicalDataset(
+                    product_id=dataset.product_id,
+                    dataset_name=auto_name,
+                    description=f"Auto-created from file: {dataset.file_name}",
+                    table_name=analytics_tbl,
+                )
+                db.add(new_ld)
+                db.commit()
+                db.refresh(new_ld)
+                final_logical_dataset_id = new_ld.id
+            
+            # Identity mapping — the file defines the schema
+            ai_column_mapping = {c.normalized_name: c.normalized_name for c in cols}
+            print(f"DEBUG: Auto-created logical dataset '{auto_name}' for file '{dataset.file_name}'")
 
     if not final_logical_dataset_id:
         raise HTTPException(
             status_code=400, 
-            detail="logical_dataset_id is required, or AI Auto-Map must confidently detect a matching schema target."
+            detail="logical_dataset_id is required, or enable auto_map=True for AI-powered schema detection."
         )
 
     req = MapDatasetRequest(
         dataset_id=dataset_id,
         logical_dataset_id=final_logical_dataset_id,
         auto_map=auto_map,
-        column_mapping=parsed_mapping
+        column_mapping=parsed_mapping or ai_column_mapping,
     )
 
     try:

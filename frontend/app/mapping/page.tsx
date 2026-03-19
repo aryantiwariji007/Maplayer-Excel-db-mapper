@@ -12,17 +12,11 @@ import {
 } from "lucide-react";
 
 export default function MappingPage() {
-  const { productId } = useAppStore();
+  const { productId, mappingDraft, setMappingDraft, resetMappingDraft } = useAppStore();
+  const { selectedDatasetId, selectedSchemaId, columnMappings } = mappingDraft;
   const qc = useQueryClient();
 
-  const [selectedDataset, setSelectedDataset] = useState<DatasetMetadata | null>(null);
-  const [selectedSchema, setSelectedSchema] = useState<TargetSchemaResponse | null>(null);
-  const [columnMappings, setColumnMappings] = useState<ColumnMapping>({});
-  const [detectedSchema, setDetectedSchema] = useState<string | null>(null);
-  const [showNewSchema, setShowNewSchema] = useState(false);
-  const [newSchemaName, setNewSchemaName] = useState("");
-  const [newSchemaColumns, setNewSchemaColumns] = useState([{ key: "", data_type: "text", description: "" }]);
-
+  // Lookups
   const { data: datasets, isLoading: loadingDatasets } = useQuery({
     queryKey: ["datasets", productId],
     queryFn: () => ingestApi.listDatasets(productId),
@@ -31,9 +25,17 @@ export default function MappingPage() {
 
   const { data: schemas, isLoading: loadingSchemas } = useQuery({
     queryKey: ["schemas", productId],
-    queryFn: () => schemasApi.list(productId),
+    queryFn: () => ingestApi.listAllSchemas(productId),
     enabled: !!productId,
   });
+
+  const selectedDataset = datasets?.find(d => d.id === selectedDatasetId) || null;
+  const selectedSchema = schemas?.find(s => String(s.id) === String(selectedSchemaId)) || null;
+
+  const [detectedSchema, setDetectedSchema] = useState<string | null>(null);
+  const [showNewSchema, setShowNewSchema] = useState(false);
+  const [newSchemaName, setNewSchemaName] = useState("");
+  const [newSchemaColumns, setNewSchemaColumns] = useState([{ key: "", data_type: "text", description: "" }]);
 
   const autoMapMutation = useMutation({
     mutationFn: async () => {
@@ -57,35 +59,75 @@ export default function MappingPage() {
         Object.entries(data.target_to_source_map).forEach(([tgt, src]) => {
           newMap[src as string] = tgt;
         });
-        setColumnMappings(newMap);
+        setMappingDraft({ columnMappings: newMap });
+        
+        // Auto-select the schema so target keys appear immediately
+        if (data.logical_dataset_id && data.detected_schema) {
+          const tempSchema = {
+             id: data.logical_dataset_id,
+             schema_name: data.detected_schema,
+             schema_type: "dynamic" as const,
+             columns: Object.keys(data.target_to_source_map).map(k => ({ key: k, data_type: "text" }))
+          } as TargetSchemaResponse;
+          setMappingDraft({ selectedSchemaId: String(tempSchema.id) });
+        }
       }
       qc.invalidateQueries({ queryKey: ["datasets", productId] });
+      qc.invalidateQueries({ queryKey: ["schemas", productId] });
     },
     onError: (err: Error) => toast.error(err.message || "Auto-map failed"),
   });
 
   const confirmMutation = useMutation({
-    mutationFn: ({ sourceCol, targetKey }: { sourceCol: string; targetKey: string }) => {
+    mutationFn: async (mappings: Record<string, string>) => {
       if (!selectedSchema) {
          throw new Error("Please select a Target Schema from the right panel to save corrections to it.");
       }
-      return mapApi.confirm({
-        product_id: productId,
-        schema_name: selectedSchema.schema_name,
-        source_column: sourceCol,
-        correct_target_key: targetKey,
+      if (!selectedDataset) {
+         throw new Error("No dataset selected.");
+      }
+      
+      // 1. Re-map the dataset and materialize the new columns
+      await ingestApi.mapDatasetToLogical(
+          selectedDataset.id,
+          selectedSchema.id as string,
+          false,
+          mappings
+      );
+      
+      // 2. Record individual corrections for AI
+      const promises = Object.entries(mappings).map(([src, tgt]) => {
+          if (tgt) {
+              return mapApi.confirm({
+                product_id: productId,
+                schema_name: selectedSchema.schema_name,
+                source_column: src,
+                correct_target_key: tgt,
+              }).catch(e => console.warn("Failed to record correction for", src, ":", e));
+          }
       });
+      await Promise.all(promises);
+      
+      return true;
     },
-    onSuccess: () => toast.success("Mapping correction saved"),
-    onError: () => toast.error("Failed to save correction"),
+    onSuccess: () => {
+        toast.success("Mapping correction saved and data re-processed!");
+        qc.invalidateQueries({ queryKey: ["datasets", productId] });
+    },
+    onError: (err: Error) => toast.error(err.message || "Failed to save correction"),
   });
 
   const deleteSchemaM = useMutation({
-    mutationFn: (id: number) => schemasApi.delete(id),
+    mutationFn: (schema: TargetSchemaResponse) => {
+      if (schema.schema_type === "dynamic") {
+         return ingestApi.deleteLogicalDataset(schema.id as string);
+      }
+      return schemasApi.delete(schema.id as number);
+    },
     onSuccess: () => {
       toast.success("Schema deleted");
       qc.invalidateQueries({ queryKey: ["schemas", productId] });
-      if (selectedSchema) setSelectedSchema(null);
+      if (selectedSchema) setMappingDraft({ selectedSchemaId: null });
     },
   });
 
@@ -128,7 +170,7 @@ export default function MappingPage() {
                   {datasets.map((ds, i) => (
                     <button
                       key={ds.id || i}
-                      onClick={() => { setSelectedDataset(ds); setColumnMappings({}); }}
+                      onClick={() => { setMappingDraft({ selectedDatasetId: ds.id, columnMappings: {} }); }}
                       style={{
                         textAlign: "left", padding: "10px 12px", borderRadius: 9, cursor: "pointer",
                         border: "1px solid",
@@ -208,7 +250,7 @@ export default function MappingPage() {
                         <select
                           value={columnMappings[col] || ""}
                           onChange={(e) =>
-                            setColumnMappings((prev) => ({ ...prev, [col]: e.target.value }))
+                            setMappingDraft({ columnMappings: { ...columnMappings, [col]: e.target.value } })
                           }
                           style={{
                             width: "100%", padding: "8px 12px",
@@ -237,11 +279,7 @@ export default function MappingPage() {
                   <div style={{ marginTop: 20, display: "flex", gap: 10 }}>
                     <button
                       className="btn-gradient"
-                      onClick={() => {
-                        Object.entries(columnMappings).forEach(([src, tgt]) => {
-                          if (tgt) confirmMutation.mutate({ sourceCol: src, targetKey: tgt });
-                        });
-                      }}
+                      onClick={() => confirmMutation.mutate(columnMappings)}
                       style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 16px" }}
                     >
                       <Send size={13} /> Save Corrections
@@ -344,12 +382,12 @@ export default function MappingPage() {
                       borderColor: selectedSchema?.id === schema.id ? "rgba(167,139,250,0.35)" : "hsl(220 15% 18%)",
                       transition: "all 0.12s",
                     }}
-                    onClick={() => setSelectedSchema(selectedSchema?.id === schema.id ? null : schema)}
+                    onClick={() => setMappingDraft({ selectedSchemaId: selectedSchema?.id === schema.id ? null : String(schema.id) })}
                   >
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                       <span style={{ fontSize: 13, fontWeight: 600, color: "hsl(220 20% 86%)" }}>{schema.schema_name}</span>
                       <button
-                        onClick={(e) => { e.stopPropagation(); deleteSchemaM.mutate(schema.id); }}
+                        onClick={(e) => { e.stopPropagation(); deleteSchemaM.mutate(schema); }}
                         style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", display: "flex" }}
                       >
                         <Trash2 size={12} />

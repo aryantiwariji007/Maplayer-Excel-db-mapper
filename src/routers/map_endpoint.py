@@ -139,13 +139,25 @@ def map_confirm(req: CorrectionRequest, db: Session = Depends(get_db)):
         TargetSchema.schema_name == req.schema_name
     )).scalars().first()
     
-    if not schema:
+    schema_id = None
+    if schema:
+        schema_id = schema.id
+    else:
+        from ..models import LogicalDataset
+        ld = db.execute(select(LogicalDataset).where(
+            LogicalDataset.product_id == req.product_id,
+            LogicalDataset.dataset_name == req.schema_name
+        )).scalars().first()
+        if ld:
+            schema_id = ld.id
+            
+    if not schema_id:
         raise HTTPException(status_code=404, detail="Schema not found")
 
     record = record_correction(
         db=db,
         product_id=req.product_id,
-        schema_id=schema.id,
+        schema_id=schema_id,
         source_column=req.source_column,
         correct_target=req.correct_target_key,
         incorrect_target=req.incorrect_target_key

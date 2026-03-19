@@ -116,7 +116,13 @@ def preview_logical_dataset(logical_dataset_id: str, limit: int = 50, db: Sessio
     if not ld:
         raise HTTPException(status_code=404, detail="Logical dataset not found")
 
-    sql = f'SELECT * FROM "{ld.table_name}" LIMIT {min(limit, 500)}'
+    # We join with the datasets table to get the human-readable filename for each row
+    sql = f'''
+        SELECT d.file_name AS source_file, t.* 
+        FROM "{ld.table_name}" t
+        LEFT JOIN datasets d ON t.dataset_id = d.id
+        LIMIT {min(limit, 500)}
+    '''
     try:
         result = query_dataset(engine, sql)
     except Exception as e:

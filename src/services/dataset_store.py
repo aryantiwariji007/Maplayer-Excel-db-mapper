@@ -128,7 +128,13 @@ def create_analytics_table(engine: Engine, table_name: str, mapping: dict, sourc
     # Also support mapping by normalized_name if that's what is passed
     source_type_map.update({c.get("normalized_name", ""): c.get("pg_type", "TEXT") for c in source_columns})
     
+    used_targets = set()
     for source_col, target_col in mapping.items():
+        if not target_col or not str(target_col).strip() or target_col == "- skip -":
+            continue
+        if target_col in used_targets:
+            continue
+        used_targets.add(target_col)
         pg_type = source_type_map.get(source_col, "TEXT")
         col_defs.append(f'"{target_col}" {pg_type}')
     
@@ -168,13 +174,24 @@ def append_to_analytics_table(
     
     # 2. Build explicit casts for each mapped column
     for src, tgt in mapping.items():
+        if not tgt or not str(tgt).strip() or tgt == "- skip -":
+            continue
+            
         target_type = target_types.get(tgt, "text").lower()
         source_type = source_types.get(src, "text").lower()
         
         # Build a safe casting expression
         if "timestamp" in target_type:
-            # Source can be timestamp, text, or bigint
-            source_cols_exprs.append(f'"{src}"::timestamp')
+            # Only cast to timestamp if source is a timestamp, or it's a numeric epoch, or it's a non-empty string that we'll hope is a timestamp
+            if "timestamp" in source_type:
+                 source_cols_exprs.append(f'"{src}"::timestamp')
+            elif "int" in source_type or "bigint" in source_type:
+                 source_cols_exprs.append(f'to_timestamp("{src}")')
+            else:
+                 # It's a string being pushed into a timestamp. 
+                 # To avoid crash, we use a NULLIF and hope for the best, 
+                 # but a better fix is type promotion which we'll handle in ingest.py
+                 source_cols_exprs.append(f'NULLIF("{src}", \'\')::timestamp')
         elif "int" in target_type or "bigint" in target_type:
             # Special check: timestamp to bigint requires explicit epoch extraction
             if "timestamp" in source_type:
@@ -234,6 +251,14 @@ def add_columns_to_analytics_table(engine: Engine, table_name: str, new_columns:
         alter_cmds.append(f'ADD COLUMN "{col_name}" {pg_type}')
         
     alter_sql = f'ALTER TABLE "{table_name}" ' + ", ".join(alter_cmds) + ";"
+    with engine.connect() as conn:
+        conn.execute(text(alter_sql))
+        conn.commit()
+
+
+def promote_column_type(engine: Engine, table_name: str, column_name: str, new_type: str) -> None:
+    """Safely ALTER a column type. Handles Postgres-specific USING clauses."""
+    alter_sql = f'ALTER TABLE "{table_name}" ALTER COLUMN "{column_name}" TYPE {new_type} USING "{column_name}"::{new_type};'
     with engine.connect() as conn:
         conn.execute(text(alter_sql))
         conn.commit()
