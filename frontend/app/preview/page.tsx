@@ -85,14 +85,14 @@ function PreviewTable({ data, label }: { data: PreviewData | { columns: string[]
         <table className="data-table">
           <thead>
             <tr>
-              {visibleCols.map((c, i) => <th key={c || i}>{c}</th>)}
+              {visibleCols.map((c, i) => <th key={`${c}-${i}`}>{c}</th>)}
             </tr>
           </thead>
           <tbody>
             {rows.map((row: any, i: number) => (
               <tr key={i}>
                 {visibleCols.map((c, j) => (
-                  <td key={c || j} style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <td key={`${c}-${j}`} style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {String(row[c] ?? "")}
                   </td>
                 ))}

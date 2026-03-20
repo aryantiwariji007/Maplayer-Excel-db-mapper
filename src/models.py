@@ -177,3 +177,18 @@ class Metric(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     logical_dataset = relationship("LogicalDataset")
+
+
+class UploadJob(Base):
+    """Tracks the status of an asynchronous background upload/ingestion job."""
+    __tablename__ = "upload_jobs"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    product_id = Column(String, nullable=False, index=True)
+    status = Column(String, default="PENDING")  # PENDING, PROCESSING, COMPLETED, FAILED
+    total_files = Column(Integer, default=0)
+    processed_files = Column(Integer, default=0)
+    results = Column(JSONB, nullable=True, default=list)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

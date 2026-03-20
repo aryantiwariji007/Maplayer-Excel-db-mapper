@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ingestApi } from "@/lib/api";
@@ -102,9 +102,8 @@ export default function UploadPage() {
   const [autoMap, setAutoMap] = useState(true);
   const [logicalName, setLogicalName] = useState("");
   const [results, setResults] = useState<any[]>([]);
-  const [showNewLogical, setShowNewLogical] = useState(false);
-  const [newLogicalDesc, setNewLogicalDesc] = useState("");
-  const [newLogicalName, setNewLogicalName] = useState("");
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [activeJob, setActiveJob] = useState<any>(null);
 
   const { data: datasets, isLoading: loadingDatasets, refetch } = useQuery({
     queryKey: ["datasets", productId],
@@ -118,28 +117,41 @@ export default function UploadPage() {
     enabled: !!productId,
   });
 
+  // Poll for job status
+  const { data: jobStatus } = useQuery({
+    queryKey: ["upload-job", jobId],
+    queryFn: () => ingestApi.getJobStatus(jobId!),
+    enabled: !!jobId && (!activeJob || activeJob.status === "PENDING" || activeJob.status === "PROCESSING"),
+    refetchInterval: 2000,
+  });
+
   const uploadMutation = useMutation({
     mutationFn: async (filesToUpload: File[]) => {
-      if (filesToUpload.length === 1) {
-        const result = await ingestApi.uploadSingle(
-          filesToUpload[0], productId, autoMap, logicalName || undefined
-        );
-        return [result];
-      } else {
-        return ingestApi.uploadBulk(filesToUpload, productId, autoMap, logicalName || undefined);
-      }
+      return ingestApi.uploadBulk(filesToUpload, productId, autoMap, logicalName || undefined);
     },
     onSuccess: (data) => {
-      setResults(data);
-      const ok = data.filter((r: any) => r.rows !== undefined || r.status === "success").length;
-      const mapped = data.filter((r: any) => r.auto_mapped).length;
-      if (ok > 0) toast.success(`${ok} file(s) uploaded${mapped > 0 ? `, ${mapped} auto-mapped` : ""}`);
-      qc.invalidateQueries({ queryKey: ["datasets", productId] });
-      qc.invalidateQueries({ queryKey: ["logical-datasets", productId] });
+      setJobId(data.job_id);
+      setActiveJob({ status: "PENDING", processed_files: 0, total_files: files.length });
       setFiles([]);
     },
     onError: (err: Error) => toast.error(err.message || "Upload failed. Check your API connection."),
   });
+
+  useEffect(() => {
+    if (jobStatus) {
+      setActiveJob(jobStatus);
+      if (jobStatus.status === "COMPLETED") {
+          setResults(jobStatus.results || []);
+          toast.success(`Upload complete: ${jobStatus.processed_files} files processed.`);
+          qc.invalidateQueries({ queryKey: ["datasets", productId] });
+          qc.invalidateQueries({ queryKey: ["logical-datasets", productId] });
+          setJobId(null); // Stop polling
+      } else if (jobStatus.status === "FAILED") {
+          toast.error(`Background processing failed: ${jobStatus.error}`);
+          setJobId(null);
+      }
+    }
+  }, [jobStatus, productId, qc]);
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => ingestApi.deleteDataset(id),
@@ -150,21 +162,7 @@ export default function UploadPage() {
     onError: () => toast.error("Failed to delete dataset"),
   });
 
-  const createLogicalMutation = useMutation({
-    mutationFn: () =>
-      ingestApi.createLogicalDataset({
-        product_id: productId,
-        dataset_name: newLogicalName,
-        description: newLogicalDesc || undefined,
-      }),
-    onSuccess: () => {
-      toast.success("Logical dataset created");
-      setShowNewLogical(false);
-      setNewLogicalName(""); setNewLogicalDesc("");
-      qc.invalidateQueries({ queryKey: ["logical-datasets", productId] });
-    },
-    onError: () => toast.error("Failed to create logical dataset"),
-  });
+
 
   const deleteDynamicSchemaMutation = useMutation({
     mutationFn: (id: string) => ingestApi.deleteLogicalDataset(id),
@@ -233,8 +231,35 @@ export default function UploadPage() {
                     <>Upload {files.length > 1 ? `${files.length} Files` : "File"}</>
                   )}
                 </button>
-              </div>
+               </div>
             </div>
+
+            {/* Background Job Progress */}
+            {activeJob && (activeJob.status === "PENDING" || activeJob.status === "PROCESSING") && (
+              <div className="card-glass" style={{ marginBottom: 20, border: `1px solid ${PURPLE}44` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <Loader2 size={16} className="spin" color={PURPLE} />
+                    <span style={{ fontWeight: 600, fontSize: 14 }}>
+                        {activeJob.status === "PENDING" ? "Queueing files..." : "AI Processing Data..."}
+                    </span>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: "hsl(220 20% 90%)" }}>
+                      {activeJob.processed_files} / {activeJob.total_files} files
+                    </div>
+                  </div>
+                </div>
+                <div style={{ width: "100%", height: 8, background: "hsl(220 15% 15%)", borderRadius: 4, overflow: "hidden" }}>
+                    <div style={{ 
+                        width: `${Math.min(100, (activeJob.processed_files / (activeJob.total_files || 1)) * 100)}%`, 
+                        height: "100%", 
+                        background: `linear-gradient(90deg, ${PURPLE}, ${BLUE})`,
+                        transition: "width 0.5s ease-out" 
+                    }} />
+                </div>
+              </div>
+            )}
 
             {/* Upload result cards */}
             {results.length > 0 && (
@@ -326,26 +351,9 @@ export default function UploadPage() {
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <Layers size={14} color={GREEN} />
-                  <h3 style={{ fontSize: 14, fontWeight: 600 }}>Dynamic Schemas</h3>
+                  <h3 style={{ fontSize: 14, fontWeight: 600 }}>Dynamic Datasets</h3>
                 </div>
-                <button
-                  onClick={() => setShowNewLogical(!showNewLogical)}
-                  style={{ background: "rgba(74,222,128,0.1)", border: "1px solid rgba(74,222,128,0.3)", borderRadius: 7, padding: "4px 10px", cursor: "pointer", color: GREEN, fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}
-                >
-                  {showNewLogical ? <X size={12} /> : <Plus size={12} />}
-                  {showNewLogical ? "Cancel" : "New"}
-                </button>
               </div>
-
-              {showNewLogical && (
-                <div style={{ marginBottom: 16, padding: 14, background: "hsl(220 15% 10%)", borderRadius: 10, border: "1px solid hsl(220 15% 18%)" }}>
-                  <input value={newLogicalName} onChange={(e) => setNewLogicalName(e.target.value)} placeholder="Schema name" style={{ width: "100%", background: "hsl(220 15% 14%)", border: "1px solid hsl(220 15% 22%)", borderRadius: 7, padding: "7px 10px", color: "hsl(220 20% 90%)", fontSize: 13, outline: "none", marginBottom: 8 }} />
-                  <input value={newLogicalDesc} onChange={(e) => setNewLogicalDesc(e.target.value)} placeholder="Description (optional)" style={{ width: "100%", background: "hsl(220 15% 14%)", border: "1px solid hsl(220 15% 22%)", borderRadius: 7, padding: "7px 10px", color: "hsl(220 20% 90%)", fontSize: 13, outline: "none", marginBottom: 10 }} />
-                  <button className="btn-gradient" onClick={() => createLogicalMutation.mutate()} disabled={!newLogicalName || createLogicalMutation.isPending} style={{ width: "100%", padding: "7px 0", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-                    {createLogicalMutation.isPending ? <Loader2 size={13} /> : <Plus size={13} />} Create
-                  </button>
-                </div>
-              )}
 
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 {logicalDatasets && logicalDatasets.length > 0 ? (
@@ -400,7 +408,7 @@ export default function UploadPage() {
                   <span style={{ fontSize: 13, fontWeight: 700, color: PURPLE }}>{datasets?.length ?? 0}</span>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span style={{ fontSize: 13, color: "hsl(220 10% 60%)" }}>Dynamic schemas</span>
+                  <span style={{ fontSize: 13, color: "hsl(220 10% 60%)" }}>Dynamic datasets</span>
                   <span style={{ fontSize: 13, fontWeight: 700, color: GREEN }}>{logicalDatasets?.length ?? 0}</span>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>

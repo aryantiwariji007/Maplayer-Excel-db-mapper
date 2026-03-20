@@ -15,14 +15,15 @@ from typing import Optional, List
 import uuid
 
 from ..database import get_db, engine
-from ..models import LogicalDataset
+from ..models import LogicalDataset, TargetSchema
 from ..utils.json_utils import sanitize_nans
+from ..services.dataset_store import query_dataset
+from ..services.gemini import discover_metrics_with_ai
 
 router = APIRouter()
 
 # ── In-DB storage (simple JSON approach — no extra migration needed) ──
-# We store composite views in a lightweight table backed by JSONB.
-# If you don't want a new migration, we can use an in-memory dict for prototyping.
+_composite_store: dict[str, dict] = {}
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
@@ -38,9 +39,41 @@ class CompositeViewCreateRequest(BaseModel):
     description: Optional[str] = None
     sources: List[CompositeViewSourceRequest]
 
-# ── Simple in-memory store (replace with DB table if needed) ──────────────────
-_composite_store: dict[str, dict] = {}
+class CompositeAnalyzeRequest(BaseModel):
+    sql_query: str
 
+# ── Helper: Build base JOIN SQL ──────────────────────────────────────────────
+
+def build_view_join_sql(sources: List[dict]):
+    if len(sources) < 2:
+        return None
+
+    # First source is primary
+    primary = sources[0]
+    p_alias = (primary.get("alias") or "t1").strip()
+    # Normalize join keys for Postgres
+    p_key = primary["join_key"].strip().lower()
+    from_clause = f'"{primary["table_name"]}" AS {p_alias}'
+
+    join_clauses = []
+    select_clauses = [f"{p_alias}.*"]
+    for i, src in enumerate(sources[1:]):
+        s_alias = (src.get("alias") or f"t{i+2}").strip()
+        s_key = src["join_key"].strip().lower()
+        select_clauses.append(f"{s_alias}.*")
+        join_clauses.append(
+            f'LEFT JOIN "{src["table_name"]}" AS {s_alias} '
+            f'ON {p_alias}."{p_key}"::TEXT = {s_alias}."{s_key}"::TEXT'
+        )
+
+    base_sql = f"""
+        SELECT {", ".join(select_clauses)}
+        FROM {from_clause}
+        {" ".join(join_clauses)}
+    """
+    return base_sql.strip()
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/views")
 def create_composite_view(req: CompositeViewCreateRequest, db: Session = Depends(get_db)):
@@ -51,17 +84,34 @@ def create_composite_view(req: CompositeViewCreateRequest, db: Session = Depends
     view_id = str(uuid.uuid4())
     sources_out = []
     for src in req.sources:
+        # First try dynamic (LogicalDataset)
         ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == src.dataset_id)).scalars().first()
-        if not ld:
-            raise HTTPException(status_code=404, detail=f"Dataset '{src.dataset_id}' not found.")
-        sources_out.append({
-            "dataset_type": src.dataset_type,
-            "dataset_id": src.dataset_id,
-            "dataset_name": ld.dataset_name,
-            "table_name": ld.table_name,
-            "join_key": src.join_key,
-            "alias": src.alias,
-        })
+        if ld:
+            sources_out.append({
+                "dataset_type": "dynamic",
+                "dataset_id": src.dataset_id,
+                "dataset_name": ld.dataset_name,
+                "table_name": ld.table_name,
+                "join_key": src.join_key.strip().lower(),
+                "alias": src.alias.strip(),
+            })
+        else:
+            # Fallback: static TargetSchema
+            ts = db.execute(select(TargetSchema).where(TargetSchema.id == src.dataset_id)).scalars().first()
+            if ts:
+                sources_out.append({
+                    "dataset_type": "static",
+                    "dataset_id": src.dataset_id,
+                    "dataset_name": ts.schema_name,
+                    "table_name": ts.schema_name,
+                    "join_key": src.join_key.strip().lower(),
+                    "alias": src.alias.strip(),
+                })
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Dataset '{src.dataset_id}' not found. Select a dataset from the dropdown."
+                )
 
     view = {
         "id": view_id,
@@ -82,45 +132,99 @@ def list_composite_views(product_id: str):
 
 @router.get("/views/{view_id}/query")
 def query_composite_view(view_id: str, limit: int = 200):
-    """Execute a composite JOIN query across multiple analytics tables."""
+    """Execute a simple preview of the composite view."""
     view = _composite_store.get(view_id)
     if not view:
         raise HTTPException(status_code=404, detail="Composite view not found.")
 
-    sources = view["sources"]
-    if len(sources) < 2:
+    sql = build_view_join_sql(view["sources"])
+    if not sql:
         raise HTTPException(status_code=400, detail="View must have at least 2 sources.")
 
-    # Build a multi-way JOIN. First source is the primary (FROM), rest are LEFT JOIN.
-    primary = sources[0]
-    p_alias = primary.get("alias") or "t1"
-    from_clause = f'"{primary["table_name"]}" AS {p_alias}'
+    sql_with_limit = f"{sql} LIMIT {limit}"
 
-    join_clauses = []
-    select_clauses = [f"{p_alias}.*"]
-    for i, src in enumerate(sources[1:]):
-        s_alias = src.get("alias") or f"t{i+2}"
-        select_clauses.append(f"{s_alias}.*")
-        join_clauses.append(
-            f'LEFT JOIN "{src["table_name"]}" AS {s_alias} '
-            f'ON {p_alias}."{primary["join_key"]}" = {s_alias}."{src["join_key"]}"'
+    try:
+        result = query_dataset(engine, sql_with_limit)
+        return sanitize_nans({
+            "columns": result["columns"],
+            "rows": result["rows"],
+            "sql": sql_with_limit.strip()
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Query failed: {str(e)}")
+
+
+@router.post("/views/{view_id}/analyze")
+def analyze_composite_view(view_id: str, req: CompositeAnalyzeRequest):
+    """Run cross-dataset analytics using CTE on the composite view."""
+    view = _composite_store.get(view_id)
+    if not view:
+        raise HTTPException(status_code=404, detail="Composite view not found.")
+
+    base_sql = build_view_join_sql(view["sources"])
+    if not base_sql:
+        raise HTTPException(status_code=400, detail="Insufficient sources in view.")
+
+    # Guard against destructive queries
+    analysis_sql = req.sql_query.strip()
+    if not analysis_sql.upper().startswith("SELECT"):
+        raise HTTPException(status_code=400, detail="Only SELECT queries are allowed.")
+
+    # Wrap the join in a CTE called 'composite_view'
+    full_sql = f"""
+        WITH composite_view AS (
+            {base_sql}
         )
-
-    sql = f"""
-        SELECT {", ".join(select_clauses)}
-        FROM {from_clause}
-        {" ".join(join_clauses)}
-        LIMIT {limit}
+        {analysis_sql}
     """
 
     try:
-        with engine.connect() as conn:
-            result = conn.execute(text(sql))
-            columns = list(result.keys())
-            rows = [dict(zip(columns, row)) for row in result.fetchall()]
-        return sanitize_nans({"columns": columns, "rows": rows, "sql": sql.strip()})
+        result = query_dataset(engine, full_sql)
+        return sanitize_nans({
+            "columns": result["columns"],
+            "rows": result["rows"],
+            "sql": full_sql.strip(),
+            "row_count": len(result["rows"])
+        })
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Query failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Analysis failed: {str(e)}")
+
+
+@router.get("/views/{view_id}/discover-metrics")
+def discover_composite_metrics(view_id: str):
+    """Suggest business metrics leveraging the joined context of the view."""
+    view = _composite_store.get(view_id)
+    if not view:
+        raise HTTPException(status_code=404, detail="Composite view not found.")
+
+    base_sql = build_view_join_sql(view["sources"])
+    if not base_sql:
+        raise HTTPException(status_code=400, detail="Insufficient sources in view.")
+
+    # 1. Get sample data (first 5 rows) to help AI understand the context
+    sample_sql = f"{base_sql} LIMIT 5"
+    try:
+        result = query_dataset(engine, sample_sql)
+        sample_data = result["rows"]
+        columns = result["columns"]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch sample for discovery: {str(e)}")
+
+    if not sample_data:
+        raise HTTPException(status_code=400, detail="No data available in joined view to discover metrics.")
+
+    # 2. Ask Gemini to suggest metrics for 'composite_view'
+    suggestions = discover_metrics_with_ai(
+        dataset_name=view["view_name"],
+        columns=columns,
+        sample_data=sample_data
+    )
+
+    return {
+        "view_id": view_id,
+        "view_name": view["view_name"],
+        "suggested_metrics": suggestions
+    }
 
 
 @router.delete("/views/{view_id}")

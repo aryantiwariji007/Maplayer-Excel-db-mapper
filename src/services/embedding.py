@@ -11,8 +11,10 @@ def get_embedding_model():
     return _model
 
 def generate_embedding(text: str) -> list[float]:
+    """Generates an embedding using the local all-MiniLM-L6-v2 model (MiniLM)."""
     model = get_embedding_model()
     if not text:
         text = ""
+    # Normalize embeddings to match cosine similarity expectations
     vector = model.encode(text, normalize_embeddings=True)
     return vector.tolist()

@@ -24,6 +24,63 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: always
 
+  redis:
+    image: redis:7-alpine
+    container_name: maplayer-redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  api:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    container_name: maplayer-api
+    depends_on:
+      - postgres
+      - qdrant
+      - redis
+    ports:
+      - "8001:8001"
+    environment:
+      - POSTGRES_HOST=postgres
+      - QDRANT_HOST=qdrant
+      - REDIS_URL=redis://redis:6379/0
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - .:/app
+    restart: always
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    container_name: maplayer-worker
+    command: celery -A src.celery_app worker --loglevel=info --concurrency=2
+    depends_on:
+      - postgres
+      - qdrant
+      - redis
+    environment:
+      - POSTGRES_HOST=postgres
+      - QDRANT_HOST=qdrant
+      - REDIS_URL=redis://redis:6379/0
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - .:/app
+    restart: always
+
+  flower:
+    image: mher/flower
+    container_name: maplayer-flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    restart: always
+
 volumes:
   postgres_data:
 

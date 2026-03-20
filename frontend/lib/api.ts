@@ -75,7 +75,7 @@ export const ingestApi = {
     productId: string,
     autoMap?: boolean,
     logicalDatasetName?: string
-  ): Promise<UploadResult[]> => {
+  ): Promise<{ job_id: string }> => {
     const form = new FormData();
     files.forEach((f) => form.append("files", f));
     form.append("product_id", productId);
@@ -84,6 +84,16 @@ export const ingestApi = {
       form.append("logical_dataset_name", logicalDatasetName);
     return api.post("/ingest/upload-bulk", form).then((r) => r.data);
   },
+
+  getJobStatus: (jobId: string): Promise<{
+    id: string;
+    status: string;
+    total_files: number;
+    processed_files: number;
+    results: UploadResult[] | null;
+    error: string | null;
+    updated_at: string;
+  }> => api.get(`/ingest/jobs/${jobId}`).then((r) => r.data),
 
   listDatasets: (productId: string): Promise<DatasetMetadata[]> =>
     api
@@ -160,6 +170,14 @@ export const compositeApi = {
 
   delete: (viewId: string): Promise<{ message: string }> =>
     api.delete(`/composite/views/${viewId}`).then((r) => r.data),
+
+  analyze: (viewId: string, sql: string): Promise<QueryResult & { sql: string }> =>
+    api.post(`/composite/views/${viewId}/analyze`, { sql_query: sql }).then((r) => r.data),
+
+  discoverMetrics: (viewId: string): Promise<DiscoveredMetric[]> =>
+    api
+      .get(`/composite/views/${viewId}/discover-metrics`)
+      .then((r) => r.data.suggested_metrics),
 };
 
 // =============================

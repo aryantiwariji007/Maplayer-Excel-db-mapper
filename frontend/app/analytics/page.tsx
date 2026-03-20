@@ -32,13 +32,13 @@ function ResultsTable({ result }: { result: QueryResult }) {
     <div style={{ overflowX: "auto", borderRadius: 10, border: "1px solid hsl(220 15% 16%)", marginTop: 12 }}>
       <table className="data-table">
         <thead>
-          <tr>{result.columns.map((c, i) => <th key={c || i}>{c}</th>)}</tr>
+          <tr>{result.columns.map((c, i) => <th key={`${c}-${i}`}>{c}</th>)}</tr>
         </thead>
         <tbody>
           {result.rows.map((row, i) => (
             <tr key={i}>
               {result.columns.map((c, j) => (
-                <td key={c || j} style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <td key={`${c}-${j}`} style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {String(row[c] ?? "")}
                 </td>
               ))}

@@ -23,13 +23,12 @@ import pandas as pd
 
 from ..database import get_db, engine
 from ..models import (
-    Dataset,
-    DatasetColumn,
     DatasetVersion,
     LogicalDataset,
     LogicalDatasetMapping,
     TargetSchema,
     TargetColumn,
+    UploadJob,
 )
 from ..services.data_processor import load_dataframe
 from ..services.schema_inference import infer_schema
@@ -430,190 +429,57 @@ async def ingest_upload_bulk(
     logical_dataset_name: Annotated[Optional[str], Form()] = None,
     db: Session = Depends(get_db),
 ):
-    results = []
+    from .celery_app import process_ingestion_job
+    import shutil
+    import os
+
+    # 1. Create a job record
+    job = UploadJob(
+        product_id=product_id,
+        status="PENDING",
+        total_files=len(files)
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    # 2. Save files to temp directory for Celery to pick up
+    temp_dir = os.path.join("storage", "temp_uploads", job.id)
+    os.makedirs(temp_dir, exist_ok=True)
+    
     for f in files:
-        file_content = await f.read()
-        if not file_content:
-            results.append({"file_name": f.filename, "status": "error", "error": "Uploaded file is empty"})
-            continue
-            
-        try:
-            # Step 1 — Parse file with smart header detection
-            df = load_dataframe(file_content, f.filename)
-            if df.empty or len(df.columns) == 0:
-                raise Exception("File contains no usable data after header detection")
+        # Sanitize filename (remove path separators if any)
+        safe_filename = os.path.basename(f.filename)
+        target_path = os.path.join(temp_dir, safe_filename)
+        with open(target_path, "wb") as buffer:
+            shutil.copyfileobj(f.file, buffer)
 
-            # Step 2 — Infer schema
-            schema_meta = infer_schema(df, product_id, f.filename)
-            dataset_meta = schema_meta["dataset"]
-            columns_meta = schema_meta["columns"]
+    # 3. Dispatch Celery Task
+    process_ingestion_job.delay(
+        job_id=job.id,
+        product_id=product_id,
+        auto_map=auto_map,
+        logical_dataset_name=logical_dataset_name
+    )
 
-            # Step 3 — Create dynamic table in Postgres
-            create_dataset_table(engine, dataset_meta["table_name"], columns_meta)
+    return {"status": "accepted", "job_id": job.id}
 
-            # Step 4 — Insert rows
-            try:
-                rows_inserted = insert_dataset_rows(engine, dataset_meta["table_name"], df, columns_meta)
-            except Exception as e:
-                drop_dataset_table(engine, dataset_meta["table_name"])
-                raise e
+@router.get("/jobs/{job_id}")
+async def get_job_status(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(UploadJob).filter(UploadJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return {
+        "id": job.id,
+        "status": job.status,
+        "total_files": job.total_files,
+        "processed_files": job.processed_files,
+        "results": job.results,
+        "error": job.error_message,
+        "updated_at": job.updated_at
+    }
 
-            # Step 5 — Persist metadata to registry
-            db_dataset = Dataset(
-                id=dataset_meta["id"],
-                product_id=product_id,
-                file_name=dataset_meta["file_name"],
-                table_name=dataset_meta["table_name"],
-                row_count=rows_inserted,
-            )
-            db.add(db_dataset)
-
-            for col in columns_meta:
-                db.add(DatasetColumn(
-                    dataset_id=dataset_meta["id"],
-                    column_name=col["column_name"],
-                    normalized_name=col["normalized_name"],
-                    data_type=col["data_type"],
-                ))
-
-            # Dataset version 1
-            db.add(DatasetVersion(
-                dataset_id=dataset_meta["id"],
-                version=1,
-                table_name=dataset_meta["table_name"],
-            ))
-            db.commit()
-
-            # Step 6 — Suggest logical datasets
-            col_dicts = [{"normalized_name": c["normalized_name"], "data_type": c["data_type"]} for c in columns_meta]
-            sample_data = df.head(5).where(pd.notna(df.head(5)), None).to_dict(orient="records")
-            try:
-                suggestions = suggest_logical_dataset(db, col_dicts, product_id, sample_data=sample_data)
-            except:
-                suggestions = []
-
-            # Step 7 — Auto-Map: Unified Schema Resolution (Static + Dynamic)
-            auto_mapped = False
-            schema_type = None
-            mapped_schema_name = None
-            mapped_schema_id = None
-            match_confidence = 0.0
-            column_mapping_used = {}
-
-            if auto_map or logical_dataset_name:
-                try:
-                    from ..services.schema_resolver import resolve_best_schema, SchemaMatch
-                    from ..services.materialization import ensure_static_table, ensure_dynamic_table, append_rows
-
-                    forced_ld = None
-                    if logical_dataset_name:
-                        forced_ld = db.execute(select(LogicalDataset).where(
-                            LogicalDataset.product_id == product_id,
-                            LogicalDataset.dataset_name == logical_dataset_name
-                        )).scalars().first()
-                        if not forced_ld:
-                            analytics_tbl = f"analytics_{str(uuid.uuid4()).replace('-', '_')}"
-                            forced_ld = LogicalDataset(
-                                product_id=product_id,
-                                dataset_name=logical_dataset_name,
-                                table_name=analytics_tbl
-                            )
-                            db.add(forced_ld)
-                            db.commit()
-                            db.refresh(forced_ld)
-
-                    if forced_ld:
-                        from ..services.similarity import get_logical_schema_columns, generate_suggested_mapping
-                        ld_cols = get_logical_schema_columns(db, forced_ld.id)
-                        if ld_cols:
-                            col_mapping = generate_suggested_mapping(
-                                [c["normalized_name"] for c in col_dicts],
-                                ld_cols,
-                                sample_data=sample_data
-                            )
-                        else:
-                            col_mapping = {c["normalized_name"]: c["normalized_name"] for c in col_dicts}
-
-                        match = SchemaMatch(
-                            schema_type="dynamic",
-                            logical_dataset_id=forced_ld.id,
-                            schema_name=forced_ld.dataset_name,
-                            confidence=1.0,
-                            column_mapping=col_mapping,
-                            analytics_table=forced_ld.table_name,
-                            reason="User-specified target schema"
-                        )
-                    else:
-                        match = resolve_best_schema(
-                            db=db,
-                            source_columns=col_dicts,
-                            sample_data=sample_data,
-                            product_id=product_id,
-                        )
-
-                    if match.schema_type != "none" and match.column_mapping:
-                        source_cols_for_mat = [
-                            {"normalized_name": c["normalized_name"], "pg_type": pg_type(c["data_type"])}
-                            for c in columns_meta
-                        ]
-
-                        if match.schema_type == "static":
-                            ensure_static_table(engine, match.analytics_table, match.column_mapping, source_cols_for_mat)
-                        else:
-                            ensure_dynamic_table(engine, match.analytics_table, match.column_mapping, source_cols_for_mat)
-
-                        append_rows(engine, match.analytics_table, dataset_meta["table_name"], match.column_mapping, dataset_meta["id"])
-
-                        if match.schema_type == "dynamic":
-                            ld_for_record = db.execute(select(LogicalDataset).where(
-                                LogicalDataset.id == match.logical_dataset_id
-                            )).scalars().first()
-                            if ld_for_record:
-                                db.add(LogicalDatasetMapping(
-                                    logical_dataset_id=ld_for_record.id,
-                                    dataset_id=dataset_meta["id"],
-                                    column_mapping=match.column_mapping,
-                                ))
-                                db.commit()
-
-                        auto_mapped = True
-                        schema_type = match.schema_type
-                        mapped_schema_name = match.schema_name
-                        mapped_schema_id = match.schema_id or match.logical_dataset_id
-                        match_confidence = match.confidence
-                        column_mapping_used = match.column_mapping
-
-                        db_dataset.schema_type = schema_type
-                        db_dataset.mapped_schema_name = mapped_schema_name
-                        db.add(db_dataset)
-                        db.commit()
-
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    print(f"DEBUG: Bulk auto-mapping failed: {e}")
-
-            res_data = {
-                "dataset_id": dataset_meta["id"],
-                "table_name": dataset_meta["table_name"],
-                "rows": rows_inserted,
-                "columns": [{"name": c["normalized_name"], "type": c["data_type"]} for c in columns_meta],
-                "status": "success",
-                "file_name": f.filename,
-                "auto_mapped": auto_mapped,
-                "schema_type": schema_type,
-                "mapped_to": mapped_schema_name,
-                "mapped_schema_id": mapped_schema_id,
-                "match_confidence": match_confidence,
-                "column_mapping": column_mapping_used,
-                "logical_dataset_suggestions": suggestions,
-            }
-            results.append(sanitize_nans(res_data))
-
-        except Exception as e:
-            results.append({"file_name": f.filename, "status": "error", "error": str(e)})
-
-    return {"status": "success", "results": results}
 
 
 

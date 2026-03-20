@@ -1,7 +1,6 @@
-"use client";
-import { useCallback, useState } from "react";
+import { useCallback, useState, useRef } from "react";
 import { useDropzone } from "react-dropzone";
-import { Upload, File, X, CloudUpload } from "lucide-react";
+import { Upload, File, X, CloudUpload, FolderUp } from "lucide-react";
 
 interface FileWithStatus {
   file: File;
@@ -19,13 +18,19 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
 
   const onDrop = useCallback(
     (accepted: File[]) => {
-      const newFiles = accepted.map((f) => ({
+      // Filter out hidden files or unsupported extensions that might sneak in via folder drop
+      const validFiles = accepted.filter(f => 
+        !f.name.startsWith('.') && 
+        (f.name.endsWith('.csv') || f.name.endsWith('.xls') || f.name.endsWith('.xlsx') || f.name.endsWith('.zip'))
+      );
+
+      const newFiles = validFiles.map((f) => ({
         file: f,
         status: "pending" as const,
         progress: 0,
       }));
       setQueued((prev) => [...prev, ...newFiles]);
-      onFilesAccepted(accepted);
+      onFilesAccepted(validFiles);
     },
     [onFilesAccepted]
   );
@@ -36,6 +41,8 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
       "text/csv": [".csv"],
       "application/vnd.ms-excel": [".xls"],
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+      "application/zip": [".zip"],
+      "application/x-zip-compressed": [".zip"],
     },
     multiple: true,
     disabled: uploading,
@@ -43,6 +50,17 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
 
   const remove = (idx: number) =>
     setQueued((prev) => prev.filter((_, i) => i !== idx));
+
+  const folderInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const fileArray = Array.from(e.target.files);
+      onDrop(fileArray);
+      // Reset input so the same folder can be selected again if needed
+      if (folderInputRef.current) folderInputRef.current.value = "";
+    }
+  };
 
   return (
     <div>
@@ -62,19 +80,46 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
           </div>
           <div>
             <p style={{ fontSize: 16, fontWeight: 600, color: "hsl(220 20% 90%)", marginBottom: 4 }}>
-              {isDragActive ? "Drop files here…" : "Drag & drop files here"}
+              {isDragActive ? "Drop files here…" : "Drag & drop files/folders here"}
             </p>
             <p style={{ fontSize: 13, color: "hsl(220 10% 55%)" }}>
-              CSV, XLS, XLSX supported · Multiple files OK
+              CSV, XLS, XLSX, ZIP supported · Folders OK
             </p>
           </div>
-          <button
-            type="button"
-            className="btn-gradient"
-            style={{ marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}
-          >
-            <Upload size={14} /> Browse Files
-          </button>
+          <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+            <button
+              type="button"
+              className="btn-gradient"
+              style={{ display: "flex", alignItems: "center", gap: 8 }}
+            >
+              <Upload size={14} /> Browse Files
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                folderInputRef.current?.click();
+              }}
+              style={{ 
+                display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", 
+                borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: "pointer", 
+                border: "1px solid hsl(220 15% 30%)", background: "hsl(220 15% 15%)", 
+                color: "hsl(220 20% 90%)", transition: "all 0.15s" 
+              }}
+            >
+              <FolderUp size={14} /> Browse Folder
+            </button>
+            <input 
+              type="file" 
+              style={{ display: "none" }} 
+              ref={folderInputRef} 
+              onChange={handleFolderSelect} 
+              {...{ webkitdirectory: "", directory: "" } as any} 
+              multiple 
+            />
+          </div>
         </div>
       </div>
 

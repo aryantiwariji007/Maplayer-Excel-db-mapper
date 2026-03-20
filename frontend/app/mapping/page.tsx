@@ -235,7 +235,7 @@ export default function MappingPage() {
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
                   {sourceColumns.map((col, i) => (
-                    <div key={col || i} className="mapping-row">
+                    <div key={`${col}-${i}`} className="mapping-row">
                       <div style={{
                         padding: "8px 12px", background: "hsl(220 15% 12%)",
                         border: "1px solid hsl(220 15% 20%)", borderRadius: 8,
@@ -261,7 +261,7 @@ export default function MappingPage() {
                         >
                           <option value="">— skip —</option>
                           {targetKeys.map((k, i) => (
-                            <option key={k || i} value={k}>{k}</option>
+                            <option key={`${k}-${i}`} value={k}>{k}</option>
                           ))}
                         </select>
                         <ChevronDown size={12} style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", color: "hsl(220 10% 45%)", pointerEvents: "none" }} />
@@ -399,7 +399,7 @@ export default function MappingPage() {
                     {selectedSchema?.id === schema.id && (
                       <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 4 }}>
                         {schema.columns.map((c, i) => (
-                          <span key={c.key || i} style={{
+                          <span key={`${c.key}-${i}`} style={{
                             fontSize: 10, padding: "2px 7px", borderRadius: 999,
                             background: "rgba(96,165,250,0.1)", border: "1px solid rgba(96,165,250,0.2)",
                             color: "#93c5fd",
