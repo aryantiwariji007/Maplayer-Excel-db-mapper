@@ -1,6 +1,6 @@
-import { useCallback, useState, useRef } from "react";
+import { useCallback, useState, useRef, useEffect } from "react";
 import { useDropzone } from "react-dropzone";
-import { Upload, File, X, CloudUpload, FolderUp } from "lucide-react";
+import { Upload, File, X, CloudUpload, FolderUp, FileUp, ChevronDown } from "lucide-react";
 
 interface FileWithStatus {
   file: File;
@@ -15,6 +15,17 @@ interface DropZoneProps {
 
 export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) {
   const [queued, setQueued] = useState<FileWithStatus[]>([]);
+  const [showMenu, setShowMenu] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node))
+        setShowMenu(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
 
   const onDrop = useCallback(
     (accepted: File[]) => {
@@ -35,7 +46,7 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
     [onFilesAccepted]
   );
 
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+  const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop,
     accept: {
       "text/csv": [".csv"],
@@ -46,6 +57,7 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
     },
     multiple: true,
     disabled: uploading,
+    noClick: true,
   });
 
   const remove = (idx: number) =>
@@ -86,38 +98,63 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
               CSV, XLS, XLSX, ZIP supported · Folders OK
             </p>
           </div>
-          <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+          <div ref={menuRef} style={{ position: "relative", marginTop: 4 }}>
             <button
               type="button"
               className="btn-gradient"
+              onClick={(e) => { e.stopPropagation(); setShowMenu(v => !v); }}
               style={{ display: "flex", alignItems: "center", gap: 8 }}
             >
-              <Upload size={14} /> Browse Files
+              <Upload size={14} /> Browse <ChevronDown size={12} />
             </button>
 
-            <button
-              type="button"
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                folderInputRef.current?.click();
-              }}
-              style={{ 
-                display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", 
-                borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: "pointer", 
-                border: "1px solid hsl(220 15% 30%)", background: "hsl(220 15% 15%)", 
-                color: "hsl(220 20% 90%)", transition: "all 0.15s" 
-              }}
-            >
-              <FolderUp size={14} /> Browse Folder
-            </button>
-            <input 
-              type="file" 
-              style={{ display: "none" }} 
-              ref={folderInputRef} 
-              onChange={handleFolderSelect} 
-              {...{ webkitdirectory: "", directory: "" } as any} 
-              multiple 
+            {showMenu && (
+              <div style={{
+                position: "absolute", top: "calc(100% + 6px)", left: "50%",
+                transform: "translateX(-50%)", zIndex: 50,
+                background: "hsl(220 15% 13%)", border: "1px solid hsl(220 15% 25%)",
+                borderRadius: 8, minWidth: 180, boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                overflow: "hidden",
+              }}>
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); setShowMenu(false); open(); }}
+                  style={{
+                    width: "100%", display: "flex", alignItems: "center", gap: 10,
+                    padding: "10px 14px", background: "none", border: "none",
+                    color: "hsl(220 20% 88%)", fontSize: 13, fontWeight: 500,
+                    cursor: "pointer", textAlign: "left",
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "hsl(220 15% 20%)")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "none")}
+                >
+                  <FileUp size={14} color="#a78bfa" /> Files (CSV, XLS, ZIP)
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); setShowMenu(false); folderInputRef.current?.click(); }}
+                  style={{
+                    width: "100%", display: "flex", alignItems: "center", gap: 10,
+                    padding: "10px 14px", background: "none", border: "none",
+                    borderTop: "1px solid hsl(220 15% 20%)",
+                    color: "hsl(220 20% 88%)", fontSize: 13, fontWeight: 500,
+                    cursor: "pointer", textAlign: "left",
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "hsl(220 15% 20%)")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "none")}
+                >
+                  <FolderUp size={14} color="#60a5fa" /> Folder
+                </button>
+              </div>
+            )}
+
+            <input
+              type="file"
+              style={{ display: "none" }}
+              ref={folderInputRef}
+              onChange={handleFolderSelect}
+              {...{ webkitdirectory: "", directory: "" } as any}
+              multiple
             />
           </div>
         </div>

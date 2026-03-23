@@ -30,7 +30,8 @@ class QueryRequest(BaseModel):
 class MetricCreateRequest(BaseModel):
     product_id: str
     metric_name: str
-    logical_dataset_id: str
+    target_id: str
+    target_type: str = "logical"
     sql_expression: str
     description: Optional[str] = None
 
@@ -149,9 +150,13 @@ def preview_logical_dataset(logical_dataset_id: str, limit: int = 50, db: Sessio
 @router.post("/metrics")
 def create_metric(req: MetricCreateRequest, db: Session = Depends(get_db)):
     """Define a reusable semantic metric."""
-    ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == req.logical_dataset_id)).scalars().first()
-    if not ld:
-        raise HTTPException(status_code=404, detail="Logical dataset not found")
+    if req.target_type == "logical":
+        target = db.execute(select(LogicalDataset).where(LogicalDataset.id == req.target_id)).scalars().first()
+    else:
+        target = db.execute(select(Dataset).where(Dataset.id == req.target_id)).scalars().first()
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Target dataset not found")
 
     # Basic safety
     if "DROP" in req.sql_expression.upper() or "DELETE" in req.sql_expression.upper() or "UPDATE" in req.sql_expression.upper() or "INSERT" in req.sql_expression.upper():
@@ -160,7 +165,8 @@ def create_metric(req: MetricCreateRequest, db: Session = Depends(get_db)):
     metric = Metric(
         product_id=req.product_id,
         metric_name=req.metric_name,
-        logical_dataset_id=req.logical_dataset_id,
+        logical_dataset_id=req.target_id if req.target_type == "logical" else None,
+        dataset_id=req.target_id if req.target_type == "single" else None,
         sql_expression=req.sql_expression,
         description=req.description,
     )
@@ -179,7 +185,10 @@ def list_metrics(product_id: str, db: Session = Depends(get_db)):
         {
             "id": m.id,
             "metric_name": m.metric_name,
+            "target_id": m.logical_dataset_id or m.dataset_id,
+            "target_type": "logical" if m.logical_dataset_id else "single",
             "logical_dataset_id": m.logical_dataset_id,
+            "dataset_id": m.dataset_id,
             "sql_expression": m.sql_expression,
             "description": m.description,
         }
@@ -194,12 +203,19 @@ def query_metric(req: MetricQueryRequest, db: Session = Depends(get_db)):
     if not metric:
         raise HTTPException(status_code=404, detail="Metric not found")
 
-    ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == metric.logical_dataset_id)).scalars().first()
-    if not ld:
-        raise HTTPException(status_code=404, detail="Logical dataset for metric not found")
+    table_name = None
+    if metric.logical_dataset_id:
+        ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == metric.logical_dataset_id)).scalars().first()
+        if ld: table_name = ld.table_name
+    elif metric.dataset_id:
+        ds = db.execute(select(Dataset).where(Dataset.id == metric.dataset_id)).scalars().first()
+        if ds: table_name = ds.table_name
+
+    if not table_name:
+        raise HTTPException(status_code=404, detail="Target table for metric not found")
 
     # Execute dynamic query on the materialized analytics table
-    sql = f'SELECT {metric.sql_expression} AS "{metric.metric_name}" FROM "{ld.table_name}"'
+    sql = f'SELECT {metric.sql_expression} AS "{metric.metric_name}" FROM "{table_name}"'
     
     try:
         result = query_dataset(engine, sql)
@@ -213,70 +229,80 @@ def query_metric(req: MetricQueryRequest, db: Session = Depends(get_db)):
     })
 
 
-@router.get("/logical-datasets/{logical_dataset_id}/discover-metrics")
-def discover_metrics(logical_dataset_id: str, db: Session = Depends(get_db)):
+@router.get("/discover-metrics")
+def discover_metrics(target_id: str, target_type: str = "logical", db: Session = Depends(get_db)):
     """
-    Automatically discover business metrics for a logical dataset using AI.
+    Automatically discover business metrics for a logical dataset or single dataset using AI.
     """
-    ld = db.execute(
-        select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)
-    ).scalars().first()
+    table_name = None
+    dataset_name = None
+
+    if target_type == "logical":
+        ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == target_id)).scalars().first()
+        if ld:
+            table_name = ld.table_name
+            dataset_name = ld.dataset_name
+    else:
+        ds = db.execute(select(Dataset).where(Dataset.id == target_id)).scalars().first()
+        if ds:
+            table_name = ds.table_name
+            dataset_name = ds.file_name
     
-    if not ld:
-        raise HTTPException(status_code=404, detail="Logical dataset not found")
+    if not table_name:
+        raise HTTPException(status_code=404, detail="Target dataset not found")
 
     # 1. Get column schema of the materialized table
     try:
-        all_cols = get_table_columns(engine, ld.table_name)
+        all_cols = get_table_columns(engine, table_name)
     except Exception:
         all_cols = []
 
     if not all_cols:
         raise HTTPException(
             status_code=400, 
-            detail="Logical dataset table not found or empty. Map some data first."
+            detail="Table not found or empty. Map some data first."
         )
 
     # 2. Get sample data (first 5 rows) to help AI understand the context
-    sample_sql = f'SELECT * FROM "{ld.table_name}" LIMIT 5'
+    sample_sql = f'SELECT * FROM "{table_name}" LIMIT 5'
     sample_res = query_dataset(engine, sample_sql)
     sample_data = sample_res["rows"]
 
     # 3. Call Gemini to suggest metrics
-    # We pass column names. For discovery, we can just pass names or types.
-    # To get types, we'd need a bit more logic, but names are often enough for discovery.
-    # Let's try to get types if possible.
     suggestions = discover_metrics_with_ai(
-        dataset_name=ld.dataset_name,
+        dataset_name=dataset_name,
         columns=all_cols,
         sample_data=sample_data
     )
 
     return {
-        "logical_dataset_id": logical_dataset_id,
-        "logical_dataset_name": ld.dataset_name,
+        "target_id": target_id,
+        "target_type": target_type,
+        "dataset_name": dataset_name,
         "suggested_metrics": suggestions
     }
 
 
 class BulkMetricSaveRequest(BaseModel):
     product_id: str
-    logical_dataset_id: str
+    target_id: str
+    target_type: str = "logical"
     metrics: list[dict] # Each dict: {metric_name, sql_expression, description}
 
 @router.post("/metrics/bulk-save")
 def bulk_save_metrics(req: BulkMetricSaveRequest, db: Session = Depends(get_db)):
     """Save multiple discovered metrics at once."""
-    # Validate logical dataset exists
-    ld = db.execute(
-        select(LogicalDataset).where(
-            LogicalDataset.id == req.logical_dataset_id,
-            LogicalDataset.product_id == req.product_id
-        )
-    ).scalars().first()
+    if req.target_type == "logical":
+        target = db.execute(
+            select(LogicalDataset).where(LogicalDataset.id == req.target_id, LogicalDataset.product_id == req.product_id)
+        ).scalars().first()
+    else:
+        target = db.execute(
+            select(Dataset).where(Dataset.id == req.target_id, Dataset.product_id == req.product_id)
+        ).scalars().first()
     
-    if not ld:
-        raise HTTPException(status_code=404, detail="Logical dataset not found or product_id mismatch")
+    if not target:
+        raise HTTPException(status_code=404, detail="Target dataset not found or product_id mismatch")
 
     saved_ids = []
     try:
@@ -284,7 +310,8 @@ def bulk_save_metrics(req: BulkMetricSaveRequest, db: Session = Depends(get_db))
             metric = Metric(
                 product_id=req.product_id,
                 metric_name=m["metric_name"],
-                logical_dataset_id=req.logical_dataset_id,
+                logical_dataset_id=req.target_id if req.target_type == "logical" else None,
+                dataset_id=req.target_id if req.target_type == "single" else None,
                 sql_expression=m["sql_expression"],
                 description=m.get("description"),
             )

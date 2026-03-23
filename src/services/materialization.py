@@ -64,8 +64,12 @@ def append_rows(engine: Engine, analytics_table: str, source_table: str, column_
 
         if "timestamp" in target_type:
             source_exprs.append(f'(CASE WHEN "{src}"::text ~ \'^[0-9]{{4}}\' THEN "{src}"::timestamp ELSE NULL END)')
+        elif "date" in target_type:
+            source_exprs.append(f'(CASE WHEN "{src}"::text ~ \'^[0-9]{{4}}\' THEN "{src}"::date ELSE NULL END)')
+        elif "time" in target_type:
+            source_exprs.append(f'(CASE WHEN "{src}"::text ~ \'^[0-9]{{2}}\' THEN "{src}"::time ELSE NULL END)')
         elif "bigint" in target_type or "integer" in target_type:
-            if "timestamp" in source_type:
+            if "timestamp" in source_type or "date" in source_type:
                 source_exprs.append(f'EXTRACT(EPOCH FROM "{src}")::bigint')
             else:
                 source_exprs.append(f'(CASE WHEN "{src}"::text ~ \'^-?[0-9]+\' THEN "{src}"::bigint ELSE NULL END)')
@@ -73,6 +77,8 @@ def append_rows(engine: Engine, analytics_table: str, source_table: str, column_
             source_exprs.append(f'(CASE WHEN "{src}"::text ~ \'^-?[0-9]\' THEN "{src}"::double precision ELSE NULL END)')
         elif "boolean" in target_type:
             source_exprs.append(f'(CASE WHEN lower("{src}"::text) IN (\'true\',\'yes\',\'1\') THEN true WHEN lower("{src}"::text) IN (\'false\',\'no\',\'0\') THEN false ELSE NULL END)')
+        elif "json" in target_type:
+             source_exprs.append(f'(CASE WHEN "{src}"::text ~ \'^[\\{{\\[]\' THEN "{src}"::jsonb ELSE NULL END)')
         else:
             source_exprs.append(f'"{src}"::text')
 

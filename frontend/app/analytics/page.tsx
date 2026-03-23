@@ -101,7 +101,10 @@ export default function AnalyticsPage() {
   // Metrics form
   const [metricName, setMetricName] = useState("");
   const [metricExpr, setMetricExpr] = useState("");
-  const [selectedLogicalId, setSelectedLogicalId] = useState<string>("");
+  const [selectedTargetId, setSelectedTargetId] = useState<string>("");
+  const [selectedTargetType, setSelectedTargetType] = useState<"logical" | "single">("logical");
+  
+  const currentTargetValue = selectedTargetId ? `${selectedTargetType}:${selectedTargetId}` : "";
 
   // Discovered metrics selection
   const [discovered, setDiscovered] = useState<DiscoveredMetric[]>([]);
@@ -113,6 +116,12 @@ export default function AnalyticsPage() {
   const { data: logicalDatasets } = useQuery({
     queryKey: ["logical-datasets", productId],
     queryFn: () => ingestApi.listLogicalDatasets(productId),
+    enabled: !!productId,
+  });
+
+  const { data: datasets } = useQuery({
+    queryKey: ["datasets", productId],
+    queryFn: () => ingestApi.listDatasets(productId),
     enabled: !!productId,
   });
 
@@ -136,7 +145,8 @@ export default function AnalyticsPage() {
       analyticsApi.createMetric({
         product_id: productId,
         metric_name: metricName,
-        logical_dataset_id: selectedLogicalId,
+        target_id: selectedTargetId,
+        target_type: selectedTargetType,
         sql_expression: metricExpr,
       }),
     onSuccess: () => {
@@ -157,7 +167,7 @@ export default function AnalyticsPage() {
   });
 
   const discoverMutation = useMutation({
-    mutationFn: (id: string) => analyticsApi.discoverMetrics(id),
+    mutationFn: () => analyticsApi.discoverMetrics(selectedTargetId, selectedTargetType),
     onSuccess: (data) => {
       setDiscovered(data);
       setSelectedDiscovered(new Set(data.map((_, i) => i)));
@@ -170,7 +180,8 @@ export default function AnalyticsPage() {
     mutationFn: () =>
       analyticsApi.bulkSaveMetrics({
         product_id: productId,
-        logical_dataset_id: selectedLogicalId,
+        target_id: selectedTargetId,
+        target_type: selectedTargetType,
         metrics: discovered.filter((_, i) => selectedDiscovered.has(i)),
       }),
     onSuccess: (data: any) => {
@@ -207,6 +218,55 @@ export default function AnalyticsPage() {
         {activeTab === "query" && (
           <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 20, maxWidth: 1100 }}>
             <div className="card-glass">
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "hsl(220 10% 55%)", marginBottom: 6 }}>
+                  Quick Target Selection (Auto-fills SQL)
+                </label>
+                <div style={{ maxWidth: 400 }}>
+                  <select
+                    value={currentTargetValue}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (!val) {
+                        setSelectedTargetId("");
+                        return;
+                      }
+                      const [type, id] = val.split(":");
+                      setSelectedTargetId(id);
+                      setSelectedTargetType(type as "logical" | "single");
+                      
+                      if (type === "logical") {
+                        const ld = logicalDatasets?.find(d => d.id === id);
+                        if (ld?.table_name) setSql(`SELECT * FROM "${ld.table_name}" LIMIT 50;`);
+                      } else {
+                        const ds = datasets?.find(d => d.id === id);
+                        if (ds?.table_name) setSql(`SELECT * FROM "${ds.table_name}" LIMIT 50;`);
+                      }
+                    }}
+                    style={{
+                      width: "100%", background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)",
+                      borderRadius: 8, padding: "8px 12px", color: "hsl(220 20% 90%)", fontSize: 13, outline: "none",
+                    }}
+                  >
+                    <option value="">— Select data target —</option>
+                    {logicalDatasets && logicalDatasets.length > 0 && (
+                      <optgroup label="Schema Groups (Combined)">
+                        {logicalDatasets.map((ld) => (
+                          <option key={`logical:${ld.id}`} value={`logical:${ld.id}`}>{ld.dataset_name}</option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {datasets && datasets.length > 0 && (
+                      <optgroup label="Single Files (Raw)">
+                        {datasets.map((ds) => (
+                          <option key={`single:${ds.id}`} value={`single:${ds.id}`}>{ds.original_filename}</option>
+                        ))}
+                      </optgroup>
+                    )}
+                  </select>
+                </div>
+              </div>
+
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
                 <h3 style={{ fontSize: 15, fontWeight: 600 }}>SQL Editor</h3>
                 <button
@@ -288,17 +348,33 @@ export default function AnalyticsPage() {
                       }}
                     />
                     <select
-                      value={selectedLogicalId}
-                      onChange={(e) => setSelectedLogicalId(e.target.value)}
+                      value={currentTargetValue}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (!val) { setSelectedTargetId(""); return; }
+                        const [type, id] = val.split(":");
+                        setSelectedTargetId(id); setSelectedTargetType(type as "logical" | "single");
+                      }}
                       style={{
                         background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)",
                         borderRadius: 8, padding: "8px 12px", color: "hsl(220 20% 90%)", fontSize: 13, outline: "none",
                       }}
                     >
-                      <option value="">— Select logical dataset —</option>
-                      {(logicalDatasets ?? []).map((ld, i) => (
-                        <option key={ld.id || i} value={ld.id}>{ld.dataset_name}</option>
-                      ))}
+                      <option value="">— Select data target —</option>
+                      {logicalDatasets && logicalDatasets.length > 0 && (
+                        <optgroup label="Schema Groups">
+                          {logicalDatasets.map((ld) => (
+                            <option key={`logical:${ld.id}`} value={`logical:${ld.id}`}>{ld.dataset_name}</option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {datasets && datasets.length > 0 && (
+                        <optgroup label="Single Files">
+                          {datasets.map((ds) => (
+                            <option key={`single:${ds.id}`} value={`single:${ds.id}`}>{ds.original_filename}</option>
+                          ))}
+                        </optgroup>
+                      )}
                     </select>
                   </div>
                   <input
@@ -314,7 +390,7 @@ export default function AnalyticsPage() {
                   <button
                     className="btn-gradient"
                     onClick={() => createMetricMutation.mutate()}
-                    disabled={!metricName || !metricExpr || !selectedLogicalId || createMetricMutation.isPending}
+                    disabled={!metricName || !metricExpr || !selectedTargetId || createMetricMutation.isPending}
                     style={{ alignSelf: "flex-start", padding: "7px 16px", display: "flex", alignItems: "center", gap: 8 }}
                   >
                     {createMetricMutation.isPending ? <Loader2 size={13} /> : <Plus size={13} />}
@@ -354,12 +430,19 @@ export default function AnalyticsPage() {
                         <button
                           onClick={() => {
                             if (!m.id) return;
-                            const ld = logicalDatasets?.find(d => d.id === m.logical_dataset_id);
-                            if (!ld || !ld.table_name) {
-                              toast.error("Logical dataset table not found. Map some data first.");
+                            let tableName = "";
+                            if (m.target_type === "logical") {
+                              const ld = logicalDatasets?.find(d => d.id === m.target_id);
+                              tableName = ld?.table_name || "";
+                            } else {
+                              const ds = datasets?.find(d => d.id === m.target_id);
+                              tableName = ds?.table_name || "";
+                            }
+                            if (!tableName) {
+                              toast.error("Target dataset table not found. It may have been deleted.");
                               return;
                             }
-                            const fullQuery = `SELECT ${m.sql_expression}\nAS "${m.metric_name}"\nFROM "${ld.table_name}";`;
+                            const fullQuery = `SELECT ${m.sql_expression}\nAS "${m.metric_name}"\nFROM "${tableName}";`;
                             setSql(fullQuery);
                             setActiveTab("query");
                             queryMutation.mutate(fullQuery);
@@ -396,23 +479,39 @@ export default function AnalyticsPage() {
                   Use Gemini AI to automatically discover meaningful business metrics for your logical dataset.
                 </p>
                 <select
-                  value={selectedLogicalId}
-                  onChange={(e) => setSelectedLogicalId(e.target.value)}
+                  value={currentTargetValue}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (!val) { setSelectedTargetId(""); return; }
+                    const [type, id] = val.split(":");
+                    setSelectedTargetId(id); setSelectedTargetType(type as "logical" | "single");
+                  }}
                   style={{
                     width: "100%", background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)",
                     borderRadius: 8, padding: "8px 12px", color: "hsl(220 20% 90%)", fontSize: 13,
                     outline: "none", marginBottom: 10,
                   }}
                 >
-                  <option value="">— Select logical dataset —</option>
-                  {(logicalDatasets ?? []).map((ld, i) => (
-                    <option key={ld.id || i} value={ld.id}>{ld.dataset_name}</option>
-                  ))}
+                  <option value="">— Select data target —</option>
+                  {logicalDatasets && logicalDatasets.length > 0 && (
+                    <optgroup label="Schema Groups">
+                      {logicalDatasets.map((ld) => (
+                        <option key={`logical:${ld.id}`} value={`logical:${ld.id}`}>{ld.dataset_name}</option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {datasets && datasets.length > 0 && (
+                    <optgroup label="Single Files">
+                      {datasets.map((ds) => (
+                        <option key={`single:${ds.id}`} value={`single:${ds.id}`}>{ds.original_filename}</option>
+                      ))}
+                    </optgroup>
+                  )}
                 </select>
                 <button
                   className="btn-gradient"
-                  onClick={() => selectedLogicalId && discoverMutation.mutate(selectedLogicalId)}
-                  disabled={!selectedLogicalId || discoverMutation.isPending}
+                  onClick={() => selectedTargetId && discoverMutation.mutate()}
+                  disabled={!selectedTargetId || discoverMutation.isPending}
                   style={{ width: "100%", padding: "8px 0", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
                 >
                   {discoverMutation.isPending ? <Loader2 size={14} /> : <Zap size={14} />}
@@ -469,7 +568,7 @@ export default function AnalyticsPage() {
                   <button
                     className="btn-gradient"
                     onClick={() => bulkSaveMutation.mutate()}
-                    disabled={selectedDiscovered.size === 0 || !selectedLogicalId || bulkSaveMutation.isPending}
+                    disabled={selectedDiscovered.size === 0 || !selectedTargetId || bulkSaveMutation.isPending}
                     style={{ width: "100%", padding: "8px 0", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
                   >
                     {bulkSaveMutation.isPending ? <Loader2 size={13} /> : <Save size={13} />}

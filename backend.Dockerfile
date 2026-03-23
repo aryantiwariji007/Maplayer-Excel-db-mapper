@@ -16,6 +16,6 @@ COPY . .
 # Create directory for temp uploads
 RUN mkdir -p storage/temp_uploads
 
-EXPOSE 8001
+EXPOSE 8000
 
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]

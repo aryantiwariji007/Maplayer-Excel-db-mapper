@@ -30,7 +30,7 @@ function SchemaTypeBadge({ type }: { type?: string | null }) {
   );
 }
 
-function UploadResultCard({ result }: { result: any }) {
+function UploadResultCard({ result, onCreateDynamicSchema }: { result: any, onCreateDynamicSchema?: (r: any) => void }) {
   const [expanded, setExpanded] = useState(false);
   const isSuccess = result.status === "success" || result.rows !== undefined;
   const confidence = result.match_confidence ?? 0;
@@ -67,7 +67,21 @@ function UploadResultCard({ result }: { result: any }) {
               </>
             )}
             {!result.auto_mapped && (
-              <span style={{ fontSize: 12, color: "hsl(220 10% 45%)" }}>Raw (no schema mapped)</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 12, color: "hsl(220 10% 45%)" }}>Raw (no schema mapped)</span>
+                {onCreateDynamicSchema && (
+                  <button
+                    onClick={() => onCreateDynamicSchema(result)}
+                    style={{
+                      background: "rgba(167,139,250,0.15)", border: "1px solid rgba(167,139,250,0.3)",
+                      color: PURPLE, fontSize: 11, padding: "2px 8px", borderRadius: 6, fontWeight: 600,
+                      cursor: "pointer", display: "flex", alignItems: "center", gap: 4
+                    }}
+                  >
+                    <Plus size={12} /> Create Schema
+                  </button>
+                )}
+              </div>
             )}
           </div>
         </div>
@@ -104,6 +118,29 @@ export default function UploadPage() {
   const [results, setResults] = useState<any[]>([]);
   const [jobId, setJobId] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<any>(null);
+
+  const createDynamicSchemaMutation = useMutation({
+    mutationFn: async (result: any) => {
+      let name = result.file_name || result.filename || "Dataset";
+      name = name.replace(/\.(xlsx|xls|csv)$/i, "");
+      const ld = await ingestApi.createLogicalDataset({
+        product_id: productId,
+        dataset_name: name,
+        description: `Auto-generated schema from ${name}`
+      });
+      await ingestApi.mapDatasetToLogical(result.dataset_id, ld.id, true);
+      return { ld, result };
+    },
+    onSuccess: (data) => {
+      toast.success(`Created & mapped to: ${data.ld.dataset_name}`);
+      qc.invalidateQueries({ queryKey: ["datasets", productId] });
+      qc.invalidateQueries({ queryKey: ["logical-datasets", productId] });
+      setResults(prev => prev.map(r => r.dataset_id === data.result.dataset_id ? {
+        ...r, auto_mapped: true, schema_type: "dynamic", mapped_to: data.ld.dataset_name, match_confidence: 1.0
+      } : r));
+    },
+    onError: (err: any) => toast.error(err.message || "Failed to create dynamic schema"),
+  });
 
   const { data: datasets, isLoading: loadingDatasets, refetch } = useQuery({
     queryKey: ["datasets", productId],
@@ -268,7 +305,17 @@ export default function UploadPage() {
                   <Zap size={15} color={PURPLE} />
                   <h3 style={{ fontSize: 14, fontWeight: 600 }}>Upload Results</h3>
                 </div>
-                {results.map((r: any, i) => <UploadResultCard key={i} result={r} />)}
+                {results.map((r: any, i) => (
+                  <UploadResultCard 
+                    key={i} 
+                    result={r} 
+                    onCreateDynamicSchema={
+                      r.status === "success" && !r.auto_mapped && !createDynamicSchemaMutation.isPending
+                        ? (res) => createDynamicSchemaMutation.mutate(res)
+                        : undefined
+                    }
+                  />
+                ))}
               </div>
             )}
 

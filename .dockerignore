@@ -1,0 +1,17 @@
+# Ignore everything that shouldn't be in the docker context
+.git
+.venv
+venv
+node_modules
+frontend/node_modules
+frontend/.next
+frontend/out
+qdrant_storage
+postgres_data
+storage/*.db
+storage/temp_uploads/*
+*.py[cod]
+__pycache__
+.env
+.env.local
+.DS_Store

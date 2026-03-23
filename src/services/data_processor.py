@@ -9,7 +9,28 @@ def load_dataframe(file_bytes: bytes, filename: str, max_search_rows: int = 50) 
     if filename.endswith(".csv"):
         df_raw = pd.read_csv(io.BytesIO(file_bytes), header=None, nrows=max_search_rows)
     elif filename.endswith(".xlsx") or filename.endswith(".xls"):
-        df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None, nrows=max_search_rows)
+        # For Excel, we should detect the sheet with the most data if multiple exist
+        try:
+            xl = pd.ExcelFile(io.BytesIO(file_bytes), engine='openpyxl')
+        except:
+            xl = pd.ExcelFile(io.BytesIO(file_bytes))
+            
+        sheet_best = xl.sheet_names[0]
+        max_pop = 0
+
+        # Heuristic: Pick sheet with most data if first sheet is suspicious
+        for sheet in xl.sheet_names:
+            try:
+                temp_df = xl.parse(sheet, header=None, nrows=30)
+                pop = temp_df.count().sum()
+                if pop > max_pop:
+                    max_pop = pop
+                    sheet_best = sheet
+            except:
+                continue
+        
+        print(f"DEBUG: Selected sheet '{sheet_best}' for {filename} (Population sample: {max_pop})")
+        df_raw = xl.parse(sheet_best, header=None, nrows=max_search_rows)
     else:
         raise ValueError("Unsupported file format. Please upload a CSV or Excel file.")
 
@@ -70,9 +91,11 @@ def load_dataframe(file_bytes: bytes, filename: str, max_search_rows: int = 50) 
     if filename.endswith(".csv"):
         df = pd.read_csv(io.BytesIO(file_bytes), skiprows=best_row_idx)
     else:
+        # Re-parse the selected sheet
         try:
-            df = pd.read_excel(io.BytesIO(file_bytes), skiprows=best_row_idx, engine='openpyxl')
+            df = xl.parse(sheet_best, skiprows=best_row_idx)
         except:
+            # Fallback to broad read if xl object failed
             df = pd.read_excel(io.BytesIO(file_bytes), skiprows=best_row_idx)
 
 

@@ -171,12 +171,14 @@ class Metric(Base):
     id = Column(String, primary_key=True, default=generate_uuid)
     product_id = Column(String, nullable=False, index=True)
     metric_name = Column(String, nullable=False)
-    logical_dataset_id = Column(String, ForeignKey("logical_datasets.id", ondelete="CASCADE"), nullable=False)
+    logical_dataset_id = Column(String, ForeignKey("logical_datasets.id", ondelete="CASCADE"), nullable=True)
+    dataset_id = Column(String, ForeignKey("datasets.id", ondelete="CASCADE"), nullable=True)
     sql_expression = Column(String, nullable=False)  # e.g., "AVG(temperature)"
     description = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
     logical_dataset = relationship("LogicalDataset")
+    dataset = relationship("Dataset")
 
 
 class UploadJob(Base):

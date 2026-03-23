@@ -51,6 +51,18 @@ def _apply_migrations():
             END IF;
         END $$;
         """,
+        # Add dataset_id to metrics to support single-file metrics
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='metrics' AND column_name='dataset_id'
+            ) THEN
+                ALTER TABLE metrics ADD COLUMN dataset_id VARCHAR REFERENCES datasets(id) ON DELETE CASCADE;
+                ALTER TABLE metrics ALTER COLUMN logical_dataset_id DROP NOT NULL;
+            END IF;
+        END $$;
+        """,
     ]
     try:
         with engine.connect() as conn:

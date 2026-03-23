@@ -77,12 +77,14 @@ export const ingestApi = {
     logicalDatasetName?: string
   ): Promise<{ job_id: string }> => {
     const form = new FormData();
+    // All file types (CSV, Excel, ZIP) go through the same "files" field.
+    // ZIP files are extracted server-side by the background worker.
     files.forEach((f) => form.append("files", f));
     form.append("product_id", productId);
     if (autoMap !== undefined) form.append("auto_map", String(autoMap));
     if (logicalDatasetName)
       form.append("logical_dataset_name", logicalDatasetName);
-    return api.post("/ingest/upload-bulk", form).then((r) => r.data);
+    return api.post("/ingest/upload-bulk", form, { timeout: 120000 }).then((r) => r.data);
   },
 
   getJobStatus: (jobId: string): Promise<{
@@ -257,9 +259,9 @@ export const analyticsApi = {
   runMetric: (metricId: number): Promise<MetricResult> =>
     api.post("/analytics/metrics/query", { metric_id: metricId }).then((r) => r.data),
 
-  discoverMetrics: (logicalDatasetId: string): Promise<DiscoveredMetric[]> =>
+  discoverMetrics: (targetId: string, targetType: "logical" | "single" = "logical"): Promise<DiscoveredMetric[]> =>
     api
-      .get(`/analytics/logical-datasets/${logicalDatasetId}/discover-metrics`)
+      .get(`/analytics/discover-metrics`, { params: { target_id: targetId, target_type: targetType } })
       .then((r) => r.data.suggested_metrics),
 
   bulkSaveMetrics: (data: BulkSaveMetricsRequest): Promise<MetricDefinition[]> =>

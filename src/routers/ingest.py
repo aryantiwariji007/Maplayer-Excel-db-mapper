@@ -23,6 +23,8 @@ import pandas as pd
 
 from ..database import get_db, engine
 from ..models import (
+    Dataset,
+    DatasetColumn,
     DatasetVersion,
     LogicalDataset,
     LogicalDatasetMapping,
@@ -423,46 +425,51 @@ async def ingest_upload(
 
 @router.post("/upload-bulk")
 async def ingest_upload_bulk(
-    files: Annotated[list[UploadFile], File(description="Select multiple files")],
     product_id: Annotated[str, Form()],
     auto_map: Annotated[bool, Form()] = False,
     logical_dataset_name: Annotated[Optional[str], Form()] = None,
+    files: List[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
 ):
-    from .celery_app import process_ingestion_job
-    import shutil
     import os
+
+    if not files:
+        raise HTTPException(status_code=400, detail="Must provide at least one file (CSV, Excel, or ZIP)")
 
     # 1. Create a job record
     job = UploadJob(
         product_id=product_id,
         status="PENDING",
-        total_files=len(files)
+        total_files=0,  # Background worker determines count after ZIP extraction
     )
     db.add(job)
     db.commit()
     db.refresh(job)
 
-    # 2. Save files to temp directory for Celery to pick up
+    # 2. Save uploaded files to temp directory using async reads
+    #    (shutil.copyfileobj is unsafe here — SpooledTemporaryFile pointer may be at EOF)
     temp_dir = os.path.join("storage", "temp_uploads", job.id)
     os.makedirs(temp_dir, exist_ok=True)
-    
+
     for f in files:
-        # Sanitize filename (remove path separators if any)
-        safe_filename = os.path.basename(f.filename)
+        content = await f.read()
+        if not content:
+            continue
+        safe_filename = os.path.basename(f.filename or "upload")
         target_path = os.path.join(temp_dir, safe_filename)
-        with open(target_path, "wb") as buffer:
-            shutil.copyfileobj(f.file, buffer)
+        with open(target_path, "wb") as out:
+            out.write(content)
 
     # 3. Dispatch Celery Task
+    from ..celery_app import process_ingestion_job
     process_ingestion_job.delay(
         job_id=job.id,
         product_id=product_id,
         auto_map=auto_map,
-        logical_dataset_name=logical_dataset_name
+        logical_dataset_name=logical_dataset_name,
     )
 
-    return {"status": "accepted", "job_id": job.id}
+    return {"status": "accepted", "job_id": job.id, "message": "Files queued for bulk processing."}
 
 @router.get("/jobs/{job_id}")
 async def get_job_status(job_id: str, db: Session = Depends(get_db)):

@@ -17,7 +17,10 @@ _TYPE_ALIASES = {
     "phone": "string",
     "url": "string",
     "number": "float",
-    "date": "timestamp",
+    "date": "date",
+    "time": "time",
+    "datetime": "timestamp",
+    "timestamp": "timestamp",
     "boolean": "boolean",
 }
 
@@ -26,6 +29,8 @@ _PG_TYPE_MAP = {
     "integer":   "BIGINT",
     "float":     "DOUBLE PRECISION",
     "boolean":   "BOOLEAN",
+    "date":      "DATE",
+    "time":      "TIME",
     "timestamp": "TIMESTAMP",
     "json":      "JSONB",
 }

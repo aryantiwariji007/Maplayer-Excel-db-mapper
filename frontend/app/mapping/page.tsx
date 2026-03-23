@@ -343,11 +343,16 @@ export default function MappingPage() {
                         }}
                         style={{ flex: 1, background: "hsl(220 15% 14%)", border: "1px solid hsl(220 15% 22%)", borderRadius: 6, color: "hsl(220 20% 90%)", fontSize: 11, outline: "none" }}
                       >
-                        <option>text</option>
-                        <option>integer</option>
-                        <option>float</option>
-                        <option>boolean</option>
-                        <option>date</option>
+                        <option value="text">text</option>
+                        <option value="integer">integer</option>
+                        <option value="float">float</option>
+                        <option value="boolean">boolean</option>
+                        <option value="date">date</option>
+                        <option value="time">time</option>
+                        <option value="datetime">datetime</option>
+                        <option value="json">json</option>
+                        <option value="email">email</option>
+                        <option value="phone">phone</option>
                       </select>
                     </div>
                   ))}

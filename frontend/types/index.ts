@@ -103,7 +103,8 @@ export interface MetricDefinition {
   id?: number;
   product_id: string;
   metric_name: string;
-  logical_dataset_id: string;
+  target_id: string;
+  target_type: "logical" | "single";
   sql_expression: string;
   created_at?: string;
 }
@@ -121,7 +122,8 @@ export interface DiscoveredMetric {
 
 export interface BulkSaveMetricsRequest {
   product_id: string;
-  logical_dataset_id: string;
+  target_id: string;
+  target_type: "logical" | "single";
   metrics: DiscoveredMetric[];
 }
 
@@ -140,6 +142,7 @@ export interface MappingDraft {
 
 export interface AppStore {
   productId: string;
+  productIds: string[];
   setProductId: (id: string) => void;
   // Drafts
   composeDraft: ComposeDraft;

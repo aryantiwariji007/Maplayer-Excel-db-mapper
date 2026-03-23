@@ -6,7 +6,12 @@ export const useAppStore = create<AppStore>()(
   persist(
     (set) => ({
       productId: "default",
-      setProductId: (id: string) => set({ productId: id }),
+      productIds: ["default", "crm-prod", "ecommerce-v2", "analytics-core"],
+      setProductId: (id: string) =>
+        set((state) => ({
+          productId: id,
+          productIds: Array.from(new Set([id, ...state.productIds])),
+        })),
 
       // Compose Draft
       composeDraft: {
