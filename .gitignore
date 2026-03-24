@@ -27,3 +27,11 @@ storage/
 testing/
 export_data.csv
 sample_feature.csv
+
+# Logs
+worker.log
+*.log
+
+# IDE / AI tools
+.claude/
+.cursor/
