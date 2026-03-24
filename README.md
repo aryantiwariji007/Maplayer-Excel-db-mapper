@@ -1,4 +1,4 @@
-# MapLayer v3.0
+# MapLayer v1.0
 
 MapLayer is a production-ready **Dynamic Schema Ingestion & Mapping Platform**. It acts as an AI-powered middleware layer that allows SaaS products to ingest arbitrary tabular data (CSV / Excel / ZIP), auto-infer schemas, semantically map source columns to unified target structures, and expose a SQL-queryable analytics layer — all without writing schema migrations.
 
