@@ -7,6 +7,7 @@ export interface TargetColumn {
   id: number;
   schema_id: number;
   key: string;
+  label: string;
   data_type: string;
   description?: string;
 }

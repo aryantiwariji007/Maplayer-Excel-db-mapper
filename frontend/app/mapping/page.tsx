@@ -136,7 +136,12 @@ export default function MappingPage() {
       schemasApi.create({
         product_id: productId,
         schema_name: newSchemaName,
-        columns: newSchemaColumns.filter((c) => c.key),
+        columns: newSchemaColumns
+          .filter((c) => c.key)
+          .map((c) => ({
+            ...c,
+            label: c.key.replace(/_/g, " ").replace(/\b\w/g, (l) => l.toUpperCase()),
+          })),
       }),
     onSuccess: () => {
       toast.success("Schema created");
