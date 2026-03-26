@@ -5,14 +5,20 @@ from src.services.qdrant_service import init_qdrant
 from src.routers import schemas, map_endpoint, ingest, analytics, composite_views
 import uvicorn
 from dotenv import load_dotenv
+import os
 
 load_dotenv()
 
 app = FastAPI(title="MapLayer API", version="3.0")
 
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS", 
+    "http://localhost:3000,http://localhost:3001"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"], # Add frontend dev ports
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
