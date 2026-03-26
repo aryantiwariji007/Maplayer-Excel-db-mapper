@@ -180,6 +180,24 @@ def perform_mapping(req: MapDatasetRequest, db: Session):
     append_to_analytics_table(engine, ld.table_name, dataset.table_name, req.column_mapping, req.dataset_id)
     db.commit()
 
+    # ── Dispatch Post-Processing Analytics Pipeline ──
+    try:
+        from ..celery_app import (
+            profile_logical_dataset,
+            detect_anomalies,
+            detect_trends,
+            generate_narrative_insight,
+        )
+        from celery import chain as celery_chain
+        celery_chain(
+            profile_logical_dataset.s(req.logical_dataset_id),
+            detect_anomalies.s(req.logical_dataset_id),
+            detect_trends.s(req.logical_dataset_id),
+            generate_narrative_insight.s(req.logical_dataset_id),
+        ).delay()
+    except Exception as e:
+        print(f"DEBUG: Failed to dispatch analytics pipeline for {req.logical_dataset_id}: {e}")
+
     # ── Fetch Samples for Feedback ──
     # Invert mapping for the UI feedback (showing logical -> physical)
     inverted_map = {v: k for k, v in req.column_mapping.items()}
@@ -386,9 +404,32 @@ async def ingest_upload(
                 mapped_schema_id = match.schema_id or match.logical_dataset_id
                 match_confidence = match.confidence
                 column_mapping_used = match.column_mapping
-                # Persist schema_type on the dataset record for future queries
+
+                # ── Ensure Logical Mapping Link ──
+                # If name matches a LogicalDataset for this product, always create a mapping link 
+                # so it appears in the Preview > Logical tree, regardless of whether type is static or dynamic.
+                ld_match = db.execute(select(LogicalDataset).where(
+                    LogicalDataset.product_id == final_product_id,
+                    LogicalDataset.dataset_name == mapped_schema_name
+                )).scalars().first()
+                if ld_match:
+                    # Check if mapping already exists
+                    existing_m = db.execute(select(LogicalDatasetMapping).where(
+                        LogicalDatasetMapping.dataset_id == dataset_meta["id"],
+                        LogicalDatasetMapping.logical_dataset_id == ld_match.id
+                    )).scalars().first()
+                    if not existing_m:
+                        db.add(LogicalDatasetMapping(
+                            logical_dataset_id=ld_match.id,
+                            dataset_id=dataset_meta["id"],
+                            column_mapping=column_mapping_used,
+                        ))
+                        db.commit()
+
+                # Persist schema_type and mapping on the dataset record for future queries
                 db_dataset.schema_type = schema_type
                 db_dataset.mapped_schema_name = mapped_schema_name
+                db_dataset.column_mapping = column_mapping_used
                 db.add(db_dataset)
                 db.commit()
                 print(f"DEBUG: Auto-mapped to {schema_type} schema '{mapped_schema_name}' (confidence={match_confidence:.2f})")
@@ -398,6 +439,18 @@ async def ingest_upload(
             import traceback
             traceback.print_exc()
             print(f"DEBUG: Auto-mapping failed: {e}")
+
+    # Step 7b — Dispatch per-file analytics pipeline
+    try:
+        from ..celery_app import profile_single_dataset, detect_single_dataset_anomalies, generate_single_dataset_narrative
+        from celery import chain as celery_chain
+        celery_chain(
+            profile_single_dataset.s(dataset_meta["id"]),
+            detect_single_dataset_anomalies.s(dataset_meta["id"]),
+            generate_single_dataset_narrative.s(dataset_meta["id"]),
+        ).delay()
+    except Exception as e:
+        print(f"DEBUG: Failed to dispatch file analytics pipeline for {dataset_meta['id']}: {e}")
 
     # Step 8 — Build suggestions for informational response
     try:
@@ -638,6 +691,9 @@ def list_logical_dataset_source_files(logical_dataset_id: str, db: Session = Dep
     ).scalars().all()
 
     results = []
+    mapped_dataset_ids = set()
+
+    # 1. Direct mappings via LogicalDatasetMapping
     for m in mappings:
         ds = db.execute(select(Dataset).where(Dataset.id == m.dataset_id)).scalars().first()
         if ds:
@@ -645,8 +701,27 @@ def list_logical_dataset_source_files(logical_dataset_id: str, db: Session = Dep
                 "dataset_id": ds.id,
                 "file_name": ds.file_name,
                 "row_count": ds.row_count,
-                "column_mapping": m.column_mapping,  # {source_col: schema_key}
+                "column_mapping": m.column_mapping,
                 "mapped_at": m.created_at,
+            })
+            mapped_dataset_ids.add(ds.id)
+
+    # 2. Add static datasets that match this LogicalDataset's name
+    #    (Handling cases where AI preferred a Static Schema with the same name)
+    datasets_by_name = db.execute(select(Dataset).where(
+        Dataset.product_id == ld.product_id,
+        Dataset.mapped_schema_name == ld.dataset_name,
+        Dataset.schema_type == 'static'
+    )).scalars().all()
+
+    for ds in datasets_by_name:
+        if ds.id not in mapped_dataset_ids:
+            results.append({
+                "dataset_id": ds.id,
+                "file_name": ds.file_name,
+                "row_count": ds.row_count,
+                "column_mapping": ds.column_mapping or {},
+                "mapped_at": ds.created_at,
             })
 
     return results
@@ -742,10 +817,14 @@ def preview_dataset_remapped(dataset_id: str, mode: str = "full", db: Session = 
     
     raw = query_dataset(engine, f'SELECT * FROM "{dataset.table_name}" LIMIT 200')
     
-    if not mapping_rec:
+    col_map = None
+    if mapping_rec:
+        col_map = mapping_rec.column_mapping
+    elif dataset.column_mapping:
+        col_map = dataset.column_mapping
+        
+    if not col_map:
         return sanitize_nans(raw)
-    
-    col_map = mapping_rec.column_mapping  # {source_normalized -> target_key}
     
     if mode == "mapped_only":
         remapped_columns = []

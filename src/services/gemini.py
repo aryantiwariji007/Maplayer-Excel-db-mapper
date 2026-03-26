@@ -144,6 +144,70 @@ Respond ONLY with valid JSON:
         return None
 
 
+def generate_narrative_with_ai(
+    dataset_name: str,
+    column_profiles: list,
+    anomaly_summary: dict,
+    trend_summary: list,
+) -> dict:
+    """
+    Generate a 3-bullet executive narrative summary from pre-computed statistics only.
+    Sends NO raw data to Gemini — only computed stats, counts, and summaries.
+
+    Returns:
+        {"narrative": "...", "bullet_points": ["...", "...", "..."]}
+    """
+    if not GEMINI_API_KEY:
+        return {"narrative": "", "bullet_points": []}
+
+    try:
+        model = genai.GenerativeModel('gemini-3-flash-preview')
+
+        prompt = f"""
+You are a senior data analyst generating an executive summary from pre-computed dataset statistics.
+You are analyzing COMPUTED STATISTICS ONLY — you are not receiving any raw customer data.
+
+Dataset Name: {dataset_name}
+
+Column Statistics Summary:
+{json.dumps(column_profiles, indent=2, cls=DateTimeEncoder)}
+
+Anomaly Detection Summary:
+- Total flagged values: {anomaly_summary.get("total", 0)}
+- High severity: {anomaly_summary.get("high", 0)}
+- Medium severity: {anomaly_summary.get("medium", 0)}
+- Low severity: {anomaly_summary.get("low", 0)}
+- Most affected columns: {json.dumps(anomaly_summary.get("top_columns", []))}
+
+Trend Analysis Summary:
+{json.dumps(trend_summary, indent=2) if trend_summary else "No time-series data detected."}
+
+Instructions:
+1. Write EXACTLY 3 bullet points as an executive summary for a business stakeholder.
+2. Be specific — reference actual numbers from the statistics (means, null percentages, anomaly counts, trend directions).
+3. Keep each bullet point to 1-2 sentences.
+4. Write in plain English, avoiding technical jargon like "z-score" or "IQR".
+5. Focus on: (1) data quality/completeness, (2) notable patterns or anomalies, (3) trends if available.
+
+Respond ONLY with valid JSON:
+{{
+    "bullet_points": [
+        "First bullet point...",
+        "Second bullet point...",
+        "Third bullet point..."
+    ]
+}}
+"""
+        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+        result = json.loads(response.text)
+        bullet_points = result.get("bullet_points", [])
+        narrative = "\n".join(f"• {b}" for b in bullet_points)
+        return {"narrative": narrative, "bullet_points": bullet_points}
+    except Exception as e:
+        print(f"Gemini Narrative Generation Error: {e}")
+        return {"narrative": "", "bullet_points": []}
+
+
 def discover_metrics_with_ai(dataset_name, columns, sample_data):
     """
     Suggest business metrics based on a dataset's columns and sample data.

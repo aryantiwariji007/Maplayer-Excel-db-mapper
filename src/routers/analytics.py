@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 
 from ..database import get_db, engine
-from ..models import Dataset, LogicalDataset, LogicalDatasetMapping, DatasetColumn, Metric
+from ..models import Dataset, LogicalDataset, LogicalDatasetMapping, DatasetColumn, Metric, DatasetProfile, DataAnomaly, TrendAnalysis, DatasetInsight, DatasetFileProfile, DatasetFileAnomaly, DatasetFileInsight
 from ..services.dataset_store import query_dataset, get_table_columns
 from ..services.gemini import discover_metrics_with_ai
 from ..utils.json_utils import sanitize_nans
@@ -283,6 +283,169 @@ def discover_metrics(target_id: str, target_type: str = "logical", db: Session =
     }
 
 
+# ── Post-Processing Analytics Pipeline Endpoints ─────────────────────────────
+
+@router.get("/logical-datasets/{logical_dataset_id}/profile")
+def get_logical_dataset_profile(logical_dataset_id: str, db: Session = Depends(get_db)):
+    """Return the pre-computed statistical profile for each column of a LogicalDataset."""
+    ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)).scalars().first()
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found")
+
+    profiles = db.execute(
+        select(DatasetProfile).where(DatasetProfile.logical_dataset_id == logical_dataset_id)
+    ).scalars().all()
+
+    if not profiles:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={"status": "pending", "message": "Profile not computed yet. It runs automatically after mapping."}
+        )
+
+    computed_at = profiles[0].computed_at.isoformat() if profiles[0].computed_at else None
+    return {
+        "logical_dataset_id": logical_dataset_id,
+        "dataset_name": ld.dataset_name,
+        "computed_at": computed_at,
+        "columns": [
+            {
+                "column_name": p.column_name,
+                "data_type": p.data_type,
+                "row_count": p.row_count,
+                "null_count": p.null_count,
+                "null_pct": p.null_pct,
+                "distinct_count": p.distinct_count,
+                "min_value": p.min_value,
+                "max_value": p.max_value,
+                "mean_value": p.mean_value,
+                "median_value": p.median_value,
+                "std_dev": p.std_dev,
+                "top_values": p.top_values or [],
+            }
+            for p in profiles
+        ],
+    }
+
+
+@router.get("/logical-datasets/{logical_dataset_id}/anomalies")
+def get_logical_dataset_anomalies(
+    logical_dataset_id: str,
+    column: Optional[str] = None,
+    severity: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """Return flagged anomalies for a LogicalDataset, optionally filtered by column and severity."""
+    ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)).scalars().first()
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found")
+
+    query = select(DataAnomaly).where(DataAnomaly.logical_dataset_id == logical_dataset_id)
+    if column:
+        query = query.where(DataAnomaly.column_name == column)
+    if severity:
+        query = query.where(DataAnomaly.severity == severity)
+    query = query.limit(min(limit, 2000))
+
+    anomalies = db.execute(query).scalars().all()
+
+    # Total count (unfiltered for summary)
+    total = db.execute(
+        select(DataAnomaly).where(DataAnomaly.logical_dataset_id == logical_dataset_id)
+    ).scalars().all()
+
+    return {
+        "logical_dataset_id": logical_dataset_id,
+        "dataset_name": ld.dataset_name,
+        "total_anomalies": len(total),
+        "anomalies": [
+            {
+                "id": a.id,
+                "column_name": a.column_name,
+                "row_index": a.row_index,
+                "value": a.value,
+                "method": a.method,
+                "reason": a.reason,
+                "severity": a.severity,
+                "computed_at": a.computed_at.isoformat() if a.computed_at else None,
+            }
+            for a in anomalies
+        ],
+    }
+
+
+@router.get("/logical-datasets/{logical_dataset_id}/trends")
+def get_logical_dataset_trends(logical_dataset_id: str, db: Session = Depends(get_db)):
+    """Return time-series trend analyses for numeric columns of a LogicalDataset."""
+    ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)).scalars().first()
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found")
+
+    trends = db.execute(
+        select(TrendAnalysis).where(TrendAnalysis.logical_dataset_id == logical_dataset_id)
+    ).scalars().all()
+
+    # Check if profile exists but no trends (might mean no timestamp columns)
+    profiles = db.execute(
+        select(DatasetProfile).where(DatasetProfile.logical_dataset_id == logical_dataset_id)
+    ).scalars().all()
+
+    if not profiles:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={"status": "pending", "message": "Trend analysis not computed yet."}
+        )
+
+    time_col = trends[0].time_column if trends else None
+    return {
+        "logical_dataset_id": logical_dataset_id,
+        "dataset_name": ld.dataset_name,
+        "has_time_data": len(trends) > 0,
+        "time_column": time_col,
+        "trends": [
+            {
+                "value_column": t.value_column,
+                "period": t.period,
+                "direction": t.direction,
+                "slope": t.slope,
+                "r_squared": t.r_squared,
+                "series_data": t.series_data or [],
+            }
+            for t in trends
+        ],
+    }
+
+
+@router.get("/logical-datasets/{logical_dataset_id}/insight")
+def get_logical_dataset_insight(logical_dataset_id: str, db: Session = Depends(get_db)):
+    """Return the LLM-generated narrative insight for a LogicalDataset (read-only, cache-based)."""
+    ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)).scalars().first()
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found")
+
+    insight = db.execute(
+        select(DatasetInsight).where(DatasetInsight.logical_dataset_id == logical_dataset_id)
+    ).scalars().first()
+
+    if not insight:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={"status": "pending", "message": "Insight generation in progress. This runs automatically after mapping."}
+        )
+
+    return {
+        "logical_dataset_id": logical_dataset_id,
+        "dataset_name": ld.dataset_name,
+        "narrative": insight.narrative,
+        "bullet_points": insight.bullet_points or [],
+        "generated_at": insight.generated_at.isoformat() if insight.generated_at else None,
+        "is_cached": True,
+    }
+
+
 class BulkMetricSaveRequest(BaseModel):
     product_id: str
     target_id: str
@@ -325,3 +488,120 @@ def bulk_save_metrics(req: BulkMetricSaveRequest, db: Session = Depends(get_db))
         raise HTTPException(status_code=400, detail=f"Failed to save metrics: {str(e)}")
 
     return {"status": "success", "saved_count": len(saved_ids), "metric_ids": saved_ids}
+
+
+# ── Per-File Analytics Endpoints ──────────────────────────────────────────────
+
+@router.get("/datasets/{dataset_id}/profile")
+def get_dataset_file_profile(dataset_id: str, db: Session = Depends(get_db)):
+    """Return the pre-computed statistical profile for each column of a single uploaded file."""
+    ds = db.execute(select(Dataset).where(Dataset.id == dataset_id)).scalars().first()
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    profiles = db.execute(
+        select(DatasetFileProfile).where(DatasetFileProfile.dataset_id == dataset_id)
+    ).scalars().all()
+
+    if not profiles:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={"status": "pending", "message": "Profile not computed yet. It runs automatically after upload."}
+        )
+
+    computed_at = profiles[0].computed_at.isoformat() if profiles[0].computed_at else None
+    return {
+        "dataset_id": dataset_id,
+        "file_name": ds.file_name,
+        "computed_at": computed_at,
+        "columns": [
+            {
+                "column_name": p.column_name,
+                "data_type": p.data_type,
+                "row_count": p.row_count,
+                "null_count": p.null_count,
+                "null_pct": p.null_pct,
+                "distinct_count": p.distinct_count,
+                "min_value": p.min_value,
+                "max_value": p.max_value,
+                "mean_value": p.mean_value,
+                "median_value": p.median_value,
+                "std_dev": p.std_dev,
+                "top_values": p.top_values or [],
+            }
+            for p in profiles
+        ],
+    }
+
+
+@router.get("/datasets/{dataset_id}/anomalies")
+def get_dataset_file_anomalies(
+    dataset_id: str,
+    column: Optional[str] = None,
+    severity: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """Return flagged anomalies for a single uploaded file."""
+    ds = db.execute(select(Dataset).where(Dataset.id == dataset_id)).scalars().first()
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    query = select(DatasetFileAnomaly).where(DatasetFileAnomaly.dataset_id == dataset_id)
+    if column:
+        query = query.where(DatasetFileAnomaly.column_name == column)
+    if severity:
+        query = query.where(DatasetFileAnomaly.severity == severity)
+    query = query.limit(min(limit, 1000))
+
+    anomalies = db.execute(query).scalars().all()
+    total_count = db.execute(
+        select(DatasetFileAnomaly).where(DatasetFileAnomaly.dataset_id == dataset_id)
+    ).scalars().all()
+
+    return {
+        "dataset_id": dataset_id,
+        "file_name": ds.file_name,
+        "total_anomalies": len(total_count),
+        "anomalies": [
+            {
+                "id": a.id,
+                "column_name": a.column_name,
+                "row_index": a.row_index,
+                "value": a.value,
+                "method": a.method,
+                "reason": a.reason,
+                "severity": a.severity,
+                "computed_at": a.computed_at.isoformat() if a.computed_at else None,
+            }
+            for a in anomalies
+        ],
+    }
+
+
+@router.get("/datasets/{dataset_id}/insight")
+def get_dataset_file_insight(dataset_id: str, db: Session = Depends(get_db)):
+    """Return the LLM-generated narrative insight for a single uploaded file."""
+    ds = db.execute(select(Dataset).where(Dataset.id == dataset_id)).scalars().first()
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    insight = db.execute(
+        select(DatasetFileInsight).where(DatasetFileInsight.dataset_id == dataset_id)
+    ).scalars().first()
+
+    if not insight:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={"status": "pending", "message": "File insight generation in progress."}
+        )
+
+    return {
+        "dataset_id": dataset_id,
+        "file_name": ds.file_name,
+        "narrative": insight.narrative,
+        "bullet_points": insight.bullet_points or [],
+        "generated_at": insight.generated_at.isoformat() if insight.generated_at else None,
+    }

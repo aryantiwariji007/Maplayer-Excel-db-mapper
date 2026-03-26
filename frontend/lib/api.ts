@@ -17,6 +17,14 @@ import type {
   PreviewData,
   MappingHistoryRecord,
   CompositeView,
+  DatasetProfileResponse,
+  AnomalyResponse,
+  TrendResponse,
+  DatasetInsightResponse,
+  PendingResponse,
+  DatasetFileProfileResponse,
+  DatasetFileAnomalyResponse,
+  DatasetFileInsightResponse,
 } from "@/types";
 
 const api = axios.create({
@@ -266,6 +274,35 @@ export const analyticsApi = {
 
   bulkSaveMetrics: (data: BulkSaveMetricsRequest): Promise<MetricDefinition[]> =>
     api.post("/analytics/metrics/bulk-save", data).then((r) => r.data),
+
+  getProfile: (logicalDatasetId: string): Promise<DatasetProfileResponse | PendingResponse> =>
+    api.get(`/analytics/logical-datasets/${logicalDatasetId}/profile`).then((r) => r.data),
+
+  getAnomalies: (
+    logicalDatasetId: string,
+    params?: { column?: string; severity?: string; limit?: number }
+  ): Promise<AnomalyResponse | PendingResponse> =>
+    api
+      .get(`/analytics/logical-datasets/${logicalDatasetId}/anomalies`, { params })
+      .then((r) => r.data),
+
+  getTrends: (logicalDatasetId: string): Promise<TrendResponse | PendingResponse> =>
+    api.get(`/analytics/logical-datasets/${logicalDatasetId}/trends`).then((r) => r.data),
+
+  getInsight: (logicalDatasetId: string): Promise<DatasetInsightResponse | PendingResponse> =>
+    api.get(`/analytics/logical-datasets/${logicalDatasetId}/insight`).then((r) => r.data),
+
+  getFileProfile: (datasetId: string): Promise<DatasetFileProfileResponse | PendingResponse> =>
+    api.get(`/analytics/datasets/${datasetId}/profile`).then((r) => r.data),
+
+  getFileAnomalies: (
+    datasetId: string,
+    params?: { column?: string; severity?: string; limit?: number }
+  ): Promise<DatasetFileAnomalyResponse | PendingResponse> =>
+    api.get(`/analytics/datasets/${datasetId}/anomalies`, { params }).then((r) => r.data),
+
+  getFileInsight: (datasetId: string): Promise<DatasetFileInsightResponse | PendingResponse> =>
+    api.get(`/analytics/datasets/${datasetId}/insight`).then((r) => r.data),
 };
 
 export default api;

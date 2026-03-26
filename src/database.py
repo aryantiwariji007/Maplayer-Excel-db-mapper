@@ -63,6 +63,17 @@ def _apply_migrations():
             END IF;
         END $$;
         """,
+        # Add column_mapping to datasets
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='datasets' AND column_name='column_mapping'
+            ) THEN
+                ALTER TABLE datasets ADD COLUMN column_mapping JSONB;
+            END IF;
+        END $$;
+        """,
     ]
     try:
         with engine.connect() as conn:

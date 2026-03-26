@@ -1,11 +1,12 @@
 import os
-from celery import Celery
+from celery import Celery, chord, chain as celery_chain
 from sqlalchemy.orm import Session
-from .database import SessionLocal
-from .models import UploadJob
+from .database import SessionLocal, engine
+from .models import (
+    UploadJob, LogicalDataset, DatasetProfile, DataAnomaly, TrendAnalysis, DatasetInsight,
+    Dataset, DatasetFileProfile, DatasetFileAnomaly, DatasetFileInsight,
+)
 from .utils.json_utils import sanitize_nans
-from celery import chord
-import os
 
 # Configure Celery with Redis as broker and result backend
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -135,16 +136,852 @@ def finalize_ingestion_job(results, job_id: str):
         job.status = "COMPLETED"
         job.results = sanitize_nans(results)
         db.commit()
-        
+
         # Clean up temp files
         import shutil
         temp_dir = os.path.join("storage", "temp_uploads", job_id)
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
-            
+
+        # Dispatch analytics pipeline for any logical datasets mapped during this job
+        logical_ids_seen = set()
+        for r in results:
+            if isinstance(r, dict) and r.get("schema_type") == "dynamic" and r.get("mapped_schema_id"):
+                logical_ids_seen.add(r["mapped_schema_id"])
+
+        for ld_id in logical_ids_seen:
+            celery_chain(
+                profile_logical_dataset.s(ld_id),
+                detect_anomalies.s(ld_id),
+                detect_trends.s(ld_id),
+                generate_narrative_insight.s(ld_id),
+            ).delay()
+
+        # Dispatch per-file analytics chain for each successfully processed file
+        for r in results:
+            if isinstance(r, dict) and r.get("dataset_id") and r.get("status") == "success":
+                celery_chain(
+                    profile_single_dataset.s(r["dataset_id"]),
+                    detect_single_dataset_anomalies.s(r["dataset_id"]),
+                    generate_single_dataset_narrative.s(r["dataset_id"]),
+                ).delay()
+
         return {"status": "success", "results_count": len(results)}
     except Exception as e:
         print(f"CELERY FINALIZER ERROR: {e}")
         return {"status": "error", "message": str(e)}
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────
+# Post-Processing Analytics Pipeline Tasks
+# ─────────────────────────────────────────────
+
+@app.task(bind=True)
+def profile_logical_dataset(self, logical_dataset_id: str) -> dict:
+    """
+    Stage 1: Compute per-column statistical profiles for a LogicalDataset.
+    Reads the materialized analytics table and calculates min/max/mean/median/std/nulls/top-values.
+    """
+    import pandas as pd
+    import numpy as np
+    from sqlalchemy import text as sa_text
+
+    db: Session = SessionLocal()
+    try:
+        ld = db.query(LogicalDataset).filter(LogicalDataset.id == logical_dataset_id).first()
+        if not ld:
+            return {"error": f"LogicalDataset {logical_dataset_id} not found"}
+
+        # Load the full materialized table
+        with engine.connect() as conn:
+            result = conn.execute(sa_text(f'SELECT * FROM "{ld.table_name}"'))
+            columns = list(result.keys())
+            rows = result.fetchall()
+
+        if not rows:
+            # Write null profiles for empty tables
+            db.query(DatasetProfile).filter(DatasetProfile.logical_dataset_id == logical_dataset_id).delete()
+            for col in columns:
+                db.add(DatasetProfile(
+                    logical_dataset_id=logical_dataset_id,
+                    column_name=col,
+                    row_count=0,
+                ))
+            db.commit()
+            return {"logical_dataset_id": logical_dataset_id, "columns_profiled": len(columns)}
+
+        df = pd.DataFrame([dict(zip(columns, row)) for row in rows])
+
+        # Determine data types from DatasetProfile source columns via mappings
+        # Build a simple lookup: column_name -> data_type from the dataframe dtypes
+        def infer_dtype(series: pd.Series) -> str:
+            if pd.api.types.is_float_dtype(series):
+                return "float"
+            if pd.api.types.is_integer_dtype(series):
+                return "integer"
+            if pd.api.types.is_bool_dtype(series):
+                return "boolean"
+            if pd.api.types.is_datetime64_any_dtype(series):
+                return "timestamp"
+            # Try parsing as datetime
+            try:
+                parsed = pd.to_datetime(series.dropna().astype(str).head(20), errors="raise")
+                if len(parsed) > 0:
+                    return "timestamp"
+            except Exception:
+                pass
+            return "string"
+
+        # Delete existing profiles for idempotency
+        db.query(DatasetProfile).filter(DatasetProfile.logical_dataset_id == logical_dataset_id).delete()
+        db.commit()
+
+        row_count = len(df)
+        profiles = []
+
+        for col in df.columns:
+            series = df[col]
+            null_count = int(series.isna().sum())
+            null_pct = round(null_count / row_count, 4) if row_count > 0 else 0.0
+            distinct_count = int(series.nunique(dropna=True))
+            data_type = infer_dtype(series)
+
+            min_val = max_val = mean_val = median_val = std_val = None
+
+            numeric_series = series.dropna()
+            if data_type in ("float", "integer") and numeric_series.notna().sum() > 1:
+                try:
+                    numeric = pd.to_numeric(numeric_series, errors="coerce").dropna()
+                    if len(numeric) > 1:
+                        min_val = str(numeric.min())
+                        max_val = str(numeric.max())
+                        mean_val = float(numeric.mean())
+                        median_val = float(numeric.median())
+                        std_val = float(numeric.std())
+                except Exception:
+                    pass
+            else:
+                try:
+                    str_series = series.dropna().astype(str)
+                    if len(str_series) > 0:
+                        min_val = str(str_series.min())
+                        max_val = str(str_series.max())
+                except Exception:
+                    pass
+
+            # Top-5 value frequencies
+            try:
+                vc = series.astype(str).value_counts().head(5)
+                top_values = [{"value": str(v), "count": int(c)} for v, c in vc.items()]
+            except Exception:
+                top_values = []
+
+            profiles.append(DatasetProfile(
+                logical_dataset_id=logical_dataset_id,
+                column_name=col,
+                data_type=data_type,
+                row_count=row_count,
+                null_count=null_count,
+                null_pct=null_pct,
+                distinct_count=distinct_count,
+                min_value=min_val,
+                max_value=max_val,
+                mean_value=mean_val,
+                median_value=median_val,
+                std_dev=std_val,
+                top_values=top_values,
+            ))
+
+        db.bulk_save_objects(profiles)
+        db.commit()
+        return {"logical_dataset_id": logical_dataset_id, "columns_profiled": len(profiles)}
+
+    except Exception as e:
+        import traceback
+        print(f"PROFILE TASK ERROR [{logical_dataset_id}]: {e}\n{traceback.format_exc()}")
+        return {"logical_dataset_id": logical_dataset_id, "error": str(e)}
+    finally:
+        db.close()
+
+
+@app.task(bind=True)
+def detect_anomalies(self, profile_result: dict, logical_dataset_id: str) -> dict:
+    """
+    Stage 2: Detect outliers and anomalies in a LogicalDataset.
+    Uses Z-Score and IQR for numeric columns; rare-value detection for categoricals.
+    """
+    import pandas as pd
+    import numpy as np
+    from sqlalchemy import text as sa_text
+
+    db: Session = SessionLocal()
+    try:
+        ld = db.query(LogicalDataset).filter(LogicalDataset.id == logical_dataset_id).first()
+        if not ld:
+            return {"error": f"LogicalDataset {logical_dataset_id} not found"}
+
+        # Load profiles to know column types
+        profiles = db.query(DatasetProfile).filter(DatasetProfile.logical_dataset_id == logical_dataset_id).all()
+        if not profiles:
+            return {"logical_dataset_id": logical_dataset_id, "anomalies_found": 0, "skipped_reason": "no_profile"}
+
+        type_map = {p.column_name: p.data_type for p in profiles}
+        row_count = profiles[0].row_count or 0
+        if row_count == 0:
+            return {"logical_dataset_id": logical_dataset_id, "anomalies_found": 0}
+
+        # Use sampling for large tables to keep performance reasonable
+        if row_count > 50000:
+            sql = f'SELECT * FROM "{ld.table_name}" TABLESAMPLE BERNOULLI(10)'
+        else:
+            sql = f'SELECT * FROM "{ld.table_name}"'
+
+        with engine.connect() as conn:
+            result = conn.execute(sa_text(sql))
+            columns = list(result.keys())
+            rows = result.fetchall()
+
+        if not rows:
+            return {"logical_dataset_id": logical_dataset_id, "anomalies_found": 0}
+
+        df = pd.DataFrame([dict(zip(columns, row)) for row in rows])
+
+        # Delete existing anomalies for idempotency
+        db.query(DataAnomaly).filter(DataAnomaly.logical_dataset_id == logical_dataset_id).delete()
+        db.commit()
+
+        anomalies = []
+        ANOMALY_CAP = 2000
+
+        from scipy.stats import zscore as scipy_zscore
+
+        for col in df.columns:
+            if len(anomalies) >= ANOMALY_CAP:
+                break
+            col_type = type_map.get(col, "string")
+
+            if col_type in ("float", "integer"):
+                numeric = pd.to_numeric(df[col], errors="coerce")
+                valid_mask = numeric.notna()
+                valid_series = numeric[valid_mask]
+
+                if valid_series.notna().sum() <= 1:
+                    continue
+
+                # Z-Score flags
+                try:
+                    z_scores = scipy_zscore(valid_series.astype(float))
+                    zscore_flags = set()
+                    for idx, (orig_idx, z) in enumerate(zip(valid_series.index, z_scores)):
+                        if abs(z) > 3:
+                            severity = "high" if abs(z) > 4 else "medium"
+                            zscore_flags.add(orig_idx)
+                            if len(anomalies) < ANOMALY_CAP:
+                                anomalies.append(DataAnomaly(
+                                    logical_dataset_id=logical_dataset_id,
+                                    column_name=col,
+                                    row_index=int(orig_idx),
+                                    value=str(df.at[orig_idx, col]),
+                                    method="zscore",
+                                    reason=f"Z-score of {z:.2f} exceeds threshold of 3.0",
+                                    severity=severity,
+                                ))
+                except Exception:
+                    zscore_flags = set()
+
+                # IQR flags
+                try:
+                    q1 = float(valid_series.quantile(0.25))
+                    q3 = float(valid_series.quantile(0.75))
+                    iqr = q3 - q1
+                    lower = q1 - 1.5 * iqr
+                    upper = q3 + 1.5 * iqr
+
+                    for orig_idx, val in valid_series.items():
+                        if val < lower or val > upper:
+                            # Upgrade existing zscore anomaly to high severity if also IQR
+                            if orig_idx in zscore_flags:
+                                for a in anomalies:
+                                    if a.row_index == int(orig_idx) and a.column_name == col and a.method == "zscore":
+                                        a.severity = "high"
+                                        break
+                            elif len(anomalies) < ANOMALY_CAP:
+                                direction = "below" if val < lower else "above"
+                                anomalies.append(DataAnomaly(
+                                    logical_dataset_id=logical_dataset_id,
+                                    column_name=col,
+                                    row_index=int(orig_idx),
+                                    value=str(val),
+                                    method="iqr",
+                                    reason=f"Value {val:.2f} is {direction} IQR boundary [{lower:.2f}, {upper:.2f}]",
+                                    severity="medium",
+                                ))
+                except Exception:
+                    pass
+
+            elif col_type == "string":
+                # Rare categorical value detection
+                try:
+                    vc = df[col].value_counts(dropna=True)
+                    total = len(df)
+                    for val, count in vc.items():
+                        if count < 3 and (count / total) < 0.005:
+                            idxs = df.index[df[col] == val].tolist()
+                            for orig_idx in idxs[:5]:  # cap per-value rows
+                                if len(anomalies) < ANOMALY_CAP:
+                                    anomalies.append(DataAnomaly(
+                                        logical_dataset_id=logical_dataset_id,
+                                        column_name=col,
+                                        row_index=int(orig_idx),
+                                        value=str(val),
+                                        method="rare_categorical",
+                                        reason=f"Value '{val}' appears only {count} time(s) ({count/total*100:.2f}% of rows)",
+                                        severity="low",
+                                    ))
+                except Exception:
+                    pass
+
+        db.bulk_save_objects(anomalies)
+        db.commit()
+        return {"logical_dataset_id": logical_dataset_id, "anomalies_found": len(anomalies)}
+
+    except Exception as e:
+        import traceback
+        print(f"ANOMALY TASK ERROR [{logical_dataset_id}]: {e}\n{traceback.format_exc()}")
+        return {"logical_dataset_id": logical_dataset_id, "error": str(e)}
+    finally:
+        db.close()
+
+
+@app.task(bind=True)
+def detect_trends(self, anomaly_result: dict, logical_dataset_id: str) -> dict:
+    """
+    Stage 3: Detect time-series trends for numeric columns in a LogicalDataset.
+    Only activates if a timestamp column is found in the profile.
+    """
+    import pandas as pd
+    import numpy as np
+    from sqlalchemy import text as sa_text
+
+    db: Session = SessionLocal()
+    try:
+        ld = db.query(LogicalDataset).filter(LogicalDataset.id == logical_dataset_id).first()
+        if not ld:
+            return {"error": f"LogicalDataset {logical_dataset_id} not found"}
+
+        profiles = db.query(DatasetProfile).filter(DatasetProfile.logical_dataset_id == logical_dataset_id).all()
+        if not profiles:
+            return {"logical_dataset_id": logical_dataset_id, "trends_found": 0, "skipped_reason": "no_profile"}
+
+        type_map = {p.column_name: p.data_type for p in profiles}
+
+        # Find timestamp columns
+        time_cols = [col for col, dtype in type_map.items() if dtype == "timestamp"]
+        if not time_cols:
+            return {"logical_dataset_id": logical_dataset_id, "trends_found": 0, "skipped_reason": "no_timestamp_column"}
+
+        time_col = time_cols[0]  # use first detected timestamp column
+        numeric_cols = [col for col, dtype in type_map.items() if dtype in ("float", "integer")]
+
+        # Load the data
+        with engine.connect() as conn:
+            result = conn.execute(sa_text(f'SELECT * FROM "{ld.table_name}"'))
+            columns = list(result.keys())
+            rows = result.fetchall()
+
+        if not rows:
+            return {"logical_dataset_id": logical_dataset_id, "trends_found": 0}
+
+        df = pd.DataFrame([dict(zip(columns, row)) for row in rows])
+
+        # Parse the timestamp column
+        try:
+            df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+        except Exception:
+            return {"logical_dataset_id": logical_dataset_id, "trends_found": 0, "skipped_reason": "timestamp_parse_failed"}
+
+        df = df.dropna(subset=[time_col])
+        if len(df) == 0:
+            return {"logical_dataset_id": logical_dataset_id, "trends_found": 0}
+
+        # Delete existing trends for idempotency
+        db.query(TrendAnalysis).filter(TrendAnalysis.logical_dataset_id == logical_dataset_id).delete()
+        db.commit()
+
+        trends = []
+        for val_col in numeric_cols:
+            if val_col == time_col:
+                continue
+            try:
+                numeric = pd.to_numeric(df[val_col], errors="coerce")
+                tmp = df[[time_col]].copy()
+                tmp["_val"] = numeric
+                tmp = tmp.dropna()
+                if len(tmp) == 0:
+                    continue
+
+                # Group by month
+                grouped = tmp.groupby(tmp[time_col].dt.to_period("M"))["_val"].mean()
+                if len(grouped) < 3:
+                    continue  # need at least 3 periods for meaningful trend
+
+                values = grouped.values.astype(float)
+                periods = [str(p) for p in grouped.index]
+                x = np.arange(len(values), dtype=float)
+
+                # Linear regression slope
+                coeffs = np.polyfit(x, values, 1)
+                slope = float(coeffs[0])
+
+                # R-squared
+                y_pred = np.polyval(coeffs, x)
+                ss_res = np.sum((values - y_pred) ** 2)
+                ss_tot = np.sum((values - values.mean()) ** 2)
+                r_squared = float(1 - ss_res / ss_tot) if ss_tot != 0 else 0.0
+
+                # Direction: slope threshold relative to mean value magnitude
+                mean_val = values.mean()
+                threshold = abs(mean_val) * 0.01 if mean_val != 0 else 0.001
+                if slope > threshold:
+                    direction = "up"
+                elif slope < -threshold:
+                    direction = "down"
+                else:
+                    direction = "flat"
+
+                series_data = [{"period": p, "value": float(v)} for p, v in zip(periods, values)]
+
+                trends.append(TrendAnalysis(
+                    logical_dataset_id=logical_dataset_id,
+                    time_column=time_col,
+                    value_column=val_col,
+                    period="month",
+                    direction=direction,
+                    slope=slope,
+                    r_squared=r_squared,
+                    series_data=series_data,
+                ))
+            except Exception:
+                continue
+
+        db.bulk_save_objects(trends)
+        db.commit()
+        return {"logical_dataset_id": logical_dataset_id, "trends_found": len(trends), "time_column": time_col}
+
+    except Exception as e:
+        import traceback
+        print(f"TRENDS TASK ERROR [{logical_dataset_id}]: {e}\n{traceback.format_exc()}")
+        return {"logical_dataset_id": logical_dataset_id, "error": str(e)}
+    finally:
+        db.close()
+
+
+@app.task(bind=True)
+def generate_narrative_insight(self, trend_result: dict, logical_dataset_id: str) -> dict:
+    """
+    Stage 4: Generate an LLM-powered executive narrative for a LogicalDataset.
+    Reads pre-computed profiles, anomalies, and trends — sends only stats to Gemini.
+    """
+    db: Session = SessionLocal()
+    try:
+        ld = db.query(LogicalDataset).filter(LogicalDataset.id == logical_dataset_id).first()
+        if not ld:
+            return {"error": f"LogicalDataset {logical_dataset_id} not found"}
+
+        # Load all pre-computed data
+        profiles = db.query(DatasetProfile).filter(DatasetProfile.logical_dataset_id == logical_dataset_id).all()
+        anomalies = db.query(DataAnomaly).filter(DataAnomaly.logical_dataset_id == logical_dataset_id).all()
+        trends = db.query(TrendAnalysis).filter(TrendAnalysis.logical_dataset_id == logical_dataset_id).all()
+
+        # Build compact profile summary (no raw data)
+        column_profiles = []
+        for p in profiles:
+            col_summary = {
+                "column": p.column_name,
+                "type": p.data_type,
+                "null_pct": round(p.null_pct or 0, 3),
+                "distinct_count": p.distinct_count,
+            }
+            if p.mean_value is not None:
+                col_summary["mean"] = round(p.mean_value, 3)
+                col_summary["std"] = round(p.std_dev or 0, 3)
+            if p.top_values:
+                col_summary["top_values"] = p.top_values[:3]
+            column_profiles.append(col_summary)
+
+        # Anomaly summary
+        high = sum(1 for a in anomalies if a.severity == "high")
+        medium = sum(1 for a in anomalies if a.severity == "medium")
+        low = sum(1 for a in anomalies if a.severity == "low")
+        top_anomaly_cols = list(dict.fromkeys(a.column_name for a in anomalies))[:5]
+        anomaly_summary = {
+            "total": len(anomalies),
+            "high": high,
+            "medium": medium,
+            "low": low,
+            "top_columns": top_anomaly_cols,
+        }
+
+        # Trend summary
+        trend_summary = [
+            {"column": t.value_column, "direction": t.direction, "slope": round(t.slope or 0, 4)}
+            for t in trends
+        ]
+
+        # Build profile_snapshot for auditability
+        profile_snapshot = {
+            "column_profiles": column_profiles,
+            "anomaly_summary": anomaly_summary,
+            "trend_summary": trend_summary,
+        }
+
+        # Call Gemini
+        try:
+            from .services.gemini import generate_narrative_with_ai
+            result = generate_narrative_with_ai(
+                dataset_name=ld.dataset_name,
+                column_profiles=column_profiles,
+                anomaly_summary=anomaly_summary,
+                trend_summary=trend_summary,
+            )
+            narrative = result.get("narrative", "")
+            bullet_points = result.get("bullet_points", [])
+        except Exception as e:
+            print(f"NARRATIVE GEMINI ERROR [{logical_dataset_id}]: {e}")
+            bullet_points = [
+                f"Dataset '{ld.dataset_name}' contains {profiles[0].row_count if profiles else 0} rows across {len(profiles)} columns.",
+                f"Anomaly detection identified {len(anomalies)} flagged values ({high} high severity).",
+                "Narrative generation encountered an error. Re-mapping the dataset will retry this step.",
+            ]
+            narrative = "\n".join(f"• {b}" for b in bullet_points)
+
+        # Upsert DatasetInsight
+        existing = db.query(DatasetInsight).filter(DatasetInsight.logical_dataset_id == logical_dataset_id).first()
+        if existing:
+            existing.narrative = narrative
+            existing.bullet_points = bullet_points
+            existing.profile_snapshot = profile_snapshot
+            import datetime
+            existing.generated_at = datetime.datetime.utcnow()
+        else:
+            db.add(DatasetInsight(
+                logical_dataset_id=logical_dataset_id,
+                narrative=narrative,
+                bullet_points=bullet_points,
+                profile_snapshot=profile_snapshot,
+            ))
+        db.commit()
+        return {"logical_dataset_id": logical_dataset_id, "status": "success"}
+
+    except Exception as e:
+        import traceback
+        print(f"NARRATIVE TASK ERROR [{logical_dataset_id}]: {e}\n{traceback.format_exc()}")
+        return {"logical_dataset_id": logical_dataset_id, "error": str(e)}
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────
+# Per-File Analytics Pipeline Tasks
+# ─────────────────────────────────────────────
+
+@app.task(bind=True)
+def profile_single_dataset(self, dataset_id: str) -> dict:
+    """Profile the raw uploaded table of a single Dataset (file-level stats)."""
+    import pandas as pd
+    import numpy as np
+    from sqlalchemy import text as sa_text
+
+    db: Session = SessionLocal()
+    try:
+        ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+        if not ds:
+            return {"error": f"Dataset {dataset_id} not found"}
+
+        with engine.connect() as conn:
+            result = conn.execute(sa_text(f'SELECT * FROM "{ds.table_name}"'))
+            columns = list(result.keys())
+            rows = result.fetchall()
+
+        db.query(DatasetFileProfile).filter(DatasetFileProfile.dataset_id == dataset_id).delete()
+        db.commit()
+
+        if not rows:
+            for col in columns:
+                db.add(DatasetFileProfile(dataset_id=dataset_id, column_name=col, row_count=0))
+            db.commit()
+            return {"dataset_id": dataset_id, "columns_profiled": len(columns)}
+
+        df = pd.DataFrame([dict(zip(columns, row)) for row in rows])
+
+        def infer_dtype(series: pd.Series) -> str:
+            if pd.api.types.is_float_dtype(series): return "float"
+            if pd.api.types.is_integer_dtype(series): return "integer"
+            if pd.api.types.is_bool_dtype(series): return "boolean"
+            if pd.api.types.is_datetime64_any_dtype(series): return "timestamp"
+            try:
+                parsed = pd.to_datetime(series.dropna().astype(str).head(20), errors="raise")
+                if len(parsed) > 0: return "timestamp"
+            except Exception:
+                pass
+            return "string"
+
+        row_count = len(df)
+        profiles = []
+        for col in df.columns:
+            series = df[col]
+            null_count = int(series.isna().sum())
+            null_pct = round(null_count / row_count, 4) if row_count > 0 else 0.0
+            distinct_count = int(series.nunique(dropna=True))
+            data_type = infer_dtype(series)
+            min_val = max_val = mean_val = median_val = std_val = None
+
+            if data_type in ("float", "integer") and series.notna().sum() > 1:
+                try:
+                    numeric = pd.to_numeric(series.dropna(), errors="coerce").dropna()
+                    if len(numeric) > 1:
+                        min_val = str(numeric.min())
+                        max_val = str(numeric.max())
+                        mean_val = float(numeric.mean())
+                        median_val = float(numeric.median())
+                        std_val = float(numeric.std())
+                except Exception:
+                    pass
+            else:
+                try:
+                    s = series.dropna().astype(str)
+                    if len(s) > 0:
+                        min_val = str(s.min())
+                        max_val = str(s.max())
+                except Exception:
+                    pass
+
+            try:
+                vc = series.astype(str).value_counts().head(5)
+                top_values = [{"value": str(v), "count": int(c)} for v, c in vc.items()]
+            except Exception:
+                top_values = []
+
+            profiles.append(DatasetFileProfile(
+                dataset_id=dataset_id,
+                column_name=col,
+                data_type=data_type,
+                row_count=row_count,
+                null_count=null_count,
+                null_pct=null_pct,
+                distinct_count=distinct_count,
+                min_value=min_val,
+                max_value=max_val,
+                mean_value=mean_val,
+                median_value=median_val,
+                std_dev=std_val,
+                top_values=top_values,
+            ))
+
+        db.bulk_save_objects(profiles)
+        db.commit()
+        return {"dataset_id": dataset_id, "columns_profiled": len(profiles)}
+
+    except Exception as e:
+        import traceback
+        print(f"FILE PROFILE TASK ERROR [{dataset_id}]: {e}\n{traceback.format_exc()}")
+        return {"dataset_id": dataset_id, "error": str(e)}
+    finally:
+        db.close()
+
+
+@app.task(bind=True)
+def detect_single_dataset_anomalies(self, profile_result: dict, dataset_id: str) -> dict:
+    """Detect anomalies in a single uploaded file's raw table."""
+    import pandas as pd
+    import numpy as np
+    from sqlalchemy import text as sa_text
+
+    db: Session = SessionLocal()
+    try:
+        ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+        if not ds:
+            return {"error": f"Dataset {dataset_id} not found"}
+
+        profiles = db.query(DatasetFileProfile).filter(DatasetFileProfile.dataset_id == dataset_id).all()
+        if not profiles:
+            return {"dataset_id": dataset_id, "anomalies_found": 0, "skipped_reason": "no_profile"}
+
+        type_map = {p.column_name: p.data_type for p in profiles}
+        row_count = profiles[0].row_count or 0
+        if row_count == 0:
+            return {"dataset_id": dataset_id, "anomalies_found": 0}
+
+        sql = f'SELECT * FROM "{ds.table_name}"' if row_count <= 50000 else \
+              f'SELECT * FROM "{ds.table_name}" TABLESAMPLE BERNOULLI(10)'
+
+        with engine.connect() as conn:
+            result = conn.execute(sa_text(sql))
+            columns = list(result.keys())
+            rows = result.fetchall()
+
+        if not rows:
+            return {"dataset_id": dataset_id, "anomalies_found": 0}
+
+        df = pd.DataFrame([dict(zip(columns, row)) for row in rows])
+
+        db.query(DatasetFileAnomaly).filter(DatasetFileAnomaly.dataset_id == dataset_id).delete()
+        db.commit()
+
+        from scipy.stats import zscore as scipy_zscore
+        anomalies = []
+        ANOMALY_CAP = 1000
+
+        for col in df.columns:
+            if len(anomalies) >= ANOMALY_CAP:
+                break
+            col_type = type_map.get(col, "string")
+
+            if col_type in ("float", "integer"):
+                numeric = pd.to_numeric(df[col], errors="coerce")
+                valid_series = numeric.dropna()
+                if valid_series.notna().sum() <= 1:
+                    continue
+                try:
+                    z_scores = scipy_zscore(valid_series.astype(float))
+                    zscore_flags = set()
+                    for orig_idx, z in zip(valid_series.index, z_scores):
+                        if abs(z) > 3:
+                            severity = "high" if abs(z) > 4 else "medium"
+                            zscore_flags.add(orig_idx)
+                            if len(anomalies) < ANOMALY_CAP:
+                                anomalies.append(DatasetFileAnomaly(
+                                    dataset_id=dataset_id, column_name=col,
+                                    row_index=int(orig_idx), value=str(df.at[orig_idx, col]),
+                                    method="zscore", reason=f"Z-score {z:.2f} exceeds 3.0",
+                                    severity=severity,
+                                ))
+                except Exception:
+                    zscore_flags = set()
+
+                try:
+                    q1, q3 = float(valid_series.quantile(0.25)), float(valid_series.quantile(0.75))
+                    iqr = q3 - q1
+                    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                    for orig_idx, val in valid_series.items():
+                        if val < lower or val > upper:
+                            if orig_idx in zscore_flags:
+                                for a in anomalies:
+                                    if a.row_index == int(orig_idx) and a.column_name == col and a.method == "zscore":
+                                        a.severity = "high"
+                                        break
+                            elif len(anomalies) < ANOMALY_CAP:
+                                direction = "below" if val < lower else "above"
+                                anomalies.append(DatasetFileAnomaly(
+                                    dataset_id=dataset_id, column_name=col,
+                                    row_index=int(orig_idx), value=str(val),
+                                    method="iqr",
+                                    reason=f"Value {val:.2f} is {direction} IQR boundary [{lower:.2f}, {upper:.2f}]",
+                                    severity="medium",
+                                ))
+                except Exception:
+                    pass
+
+            elif col_type == "string":
+                try:
+                    vc = df[col].value_counts(dropna=True)
+                    total = len(df)
+                    for val, count in vc.items():
+                        if count < 3 and (count / total) < 0.005:
+                            for orig_idx in df.index[df[col] == val].tolist()[:3]:
+                                if len(anomalies) < ANOMALY_CAP:
+                                    anomalies.append(DatasetFileAnomaly(
+                                        dataset_id=dataset_id, column_name=col,
+                                        row_index=int(orig_idx), value=str(val),
+                                        method="rare_categorical",
+                                        reason=f"Value '{val}' appears {count} time(s) ({count/total*100:.2f}%)",
+                                        severity="low",
+                                    ))
+                except Exception:
+                    pass
+
+        db.bulk_save_objects(anomalies)
+        db.commit()
+        return {"dataset_id": dataset_id, "anomalies_found": len(anomalies)}
+
+    except Exception as e:
+        import traceback
+        print(f"FILE ANOMALY TASK ERROR [{dataset_id}]: {e}\n{traceback.format_exc()}")
+        return {"dataset_id": dataset_id, "error": str(e)}
+    finally:
+        db.close()
+
+
+@app.task(bind=True)
+def generate_single_dataset_narrative(self, anomaly_result: dict, dataset_id: str) -> dict:
+    """Generate an LLM narrative for a single uploaded file using its pre-computed stats."""
+    db: Session = SessionLocal()
+    try:
+        ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+        if not ds:
+            return {"error": f"Dataset {dataset_id} not found"}
+
+        profiles = db.query(DatasetFileProfile).filter(DatasetFileProfile.dataset_id == dataset_id).all()
+        anomalies = db.query(DatasetFileAnomaly).filter(DatasetFileAnomaly.dataset_id == dataset_id).all()
+
+        column_profiles = []
+        for p in profiles:
+            col_summary = {
+                "column": p.column_name, "type": p.data_type,
+                "null_pct": round(p.null_pct or 0, 3), "distinct_count": p.distinct_count,
+            }
+            if p.mean_value is not None:
+                col_summary["mean"] = round(p.mean_value, 3)
+                col_summary["std"] = round(p.std_dev or 0, 3)
+            if p.top_values:
+                col_summary["top_values"] = p.top_values[:3]
+            column_profiles.append(col_summary)
+
+        high = sum(1 for a in anomalies if a.severity == "high")
+        medium = sum(1 for a in anomalies if a.severity == "medium")
+        low = sum(1 for a in anomalies if a.severity == "low")
+        anomaly_summary = {
+            "total": len(anomalies), "high": high, "medium": medium, "low": low,
+            "top_columns": list(dict.fromkeys(a.column_name for a in anomalies))[:5],
+        }
+
+        try:
+            from .services.gemini import generate_narrative_with_ai
+            result = generate_narrative_with_ai(
+                dataset_name=ds.file_name,
+                column_profiles=column_profiles,
+                anomaly_summary=anomaly_summary,
+                trend_summary=[],
+            )
+            narrative = result.get("narrative", "")
+            bullet_points = result.get("bullet_points", [])
+        except Exception as e:
+            print(f"FILE NARRATIVE GEMINI ERROR [{dataset_id}]: {e}")
+            bullet_points = [
+                f"File '{ds.file_name}' contains {profiles[0].row_count if profiles else 0} rows across {len(profiles)} columns.",
+                f"Anomaly detection flagged {len(anomalies)} values ({high} high severity).",
+                "Narrative generation encountered an error. Re-uploading the file will retry this step.",
+            ]
+            narrative = "\n".join(f"• {b}" for b in bullet_points)
+
+        existing = db.query(DatasetFileInsight).filter(DatasetFileInsight.dataset_id == dataset_id).first()
+        if existing:
+            existing.narrative = narrative
+            existing.bullet_points = bullet_points
+            import datetime
+            existing.generated_at = datetime.datetime.utcnow()
+        else:
+            db.add(DatasetFileInsight(
+                dataset_id=dataset_id, narrative=narrative, bullet_points=bullet_points,
+            ))
+        db.commit()
+        return {"dataset_id": dataset_id, "status": "success"}
+
+    except Exception as e:
+        import traceback
+        print(f"FILE NARRATIVE TASK ERROR [{dataset_id}]: {e}\n{traceback.format_exc()}")
+        return {"dataset_id": dataset_id, "error": str(e)}
     finally:
         db.close()

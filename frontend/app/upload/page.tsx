@@ -190,6 +190,9 @@ export default function UploadPage() {
     }
   }, [jobStatus, productId, qc]);
 
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+
   const deleteMutation = useMutation({
     mutationFn: (id: string) => ingestApi.deleteDataset(id),
     onSuccess: () => {
@@ -198,6 +201,40 @@ export default function UploadPage() {
     },
     onError: () => toast.error("Failed to delete dataset"),
   });
+
+  const handleBulkDelete = async () => {
+    if (checkedIds.size === 0 || bulkDeleting) return;
+    setBulkDeleting(true);
+    const ids = Array.from(checkedIds);
+    try {
+      await Promise.all(ids.map((id) => ingestApi.deleteDataset(id)));
+      setCheckedIds(new Set());
+      toast.success(`Deleted ${ids.length} dataset${ids.length > 1 ? "s" : ""}`);
+      qc.invalidateQueries({ queryKey: ["datasets", productId] });
+    } catch {
+      toast.error("Some deletions failed");
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
+  const toggleCheck = (id: string) =>
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+  const allChecked = !!datasets?.length && datasets.every((ds) => checkedIds.has(ds.id));
+  const someChecked = !!datasets?.length && datasets.some((ds) => checkedIds.has(ds.id)) && !allChecked;
+
+  const toggleAll = () => {
+    if (allChecked) {
+      setCheckedIds(new Set());
+    } else {
+      setCheckedIds(new Set(datasets?.map((ds) => ds.id) ?? []));
+    }
+  };
 
 
 
@@ -321,12 +358,68 @@ export default function UploadPage() {
 
             {/* Datasets table */}
             <div className="card-glass">
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: checkedIds.size > 0 ? 10 : 16 }}>
                 <h3 style={{ fontSize: 15, fontWeight: 600 }}>Ingested Datasets</h3>
                 <button onClick={() => refetch()} style={{ background: "none", border: "none", cursor: "pointer", color: "hsl(220 10% 55%)", display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
                   <RefreshCw size={13} /> Refresh
                 </button>
               </div>
+
+              {/* Bulk delete floating bar */}
+              {checkedIds.size > 0 && (
+                <div style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  padding: "10px 16px", marginBottom: 16, borderRadius: 12,
+                  background: "linear-gradient(135deg, rgba(239,68,68,0.1), rgba(239,68,68,0.05))",
+                  border: "1px solid rgba(239,68,68,0.3)",
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.2)",
+                  animation: "fadeIn 0.2s ease-out",
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{ width: 32, height: 32, borderRadius: "50%", background: "rgba(239,68,68,0.12)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      <Trash2 size={16} color="#f87171" />
+                    </div>
+                    <div>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: "#f87171", display: "block" }}>
+                        Bulk Actions
+                      </span>
+                      <span style={{ fontSize: 11, color: "hsl(220 10% 55%)" }}>
+                        {checkedIds.size} file{checkedIds.size > 1 ? "s" : ""} selected for deletion
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      onClick={() => setCheckedIds(new Set())}
+                      style={{
+                        padding: "6px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+                        background: "transparent", border: "1px solid hsl(220 15% 22%)",
+                        cursor: "pointer", color: "hsl(220 10% 60%)",
+                        display: "flex", alignItems: "center", gap: 6,
+                      }}
+                    >
+                      <X size={14} /> Clear Selection
+                    </button>
+                    <button
+                      onClick={handleBulkDelete}
+                      disabled={bulkDeleting}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 6, padding: "6px 16px",
+                        borderRadius: 8, border: "none",
+                        background: "#ef4444", color: "white",
+                        cursor: bulkDeleting ? "not-allowed" : "pointer",
+                        fontSize: 12, fontWeight: 700, opacity: bulkDeleting ? 0.6 : 1,
+                        boxShadow: "0 2px 4px rgba(0,0,0,0.2)",
+                      }}
+                    >
+                      {bulkDeleting
+                        ? <><Loader2 size={14} className="spin" /> Deleting…</>
+                        : <><Trash2 size={14} /> Delete Selected</>
+                      }
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {loadingDatasets ? (
                 <div style={{ textAlign: "center", padding: 40, color: "hsl(220 10% 50%)" }}>
@@ -337,6 +430,20 @@ export default function UploadPage() {
                   <table className="data-table">
                     <thead>
                       <tr>
+                        <th style={{ width: 44, paddingRight: 0 }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <input
+                              type="checkbox"
+                              checked={allChecked}
+                              ref={(el) => { if (el) el.indeterminate = someChecked; }}
+                              onChange={toggleAll}
+                              style={{
+                                cursor: "pointer", width: 16, height: 16,
+                                accentColor: "#f87171",
+                              }}
+                            />
+                          </div>
+                        </th>
                         <th>Filename</th>
                         <th>Table</th>
                         <th>Rows</th>
@@ -347,26 +454,49 @@ export default function UploadPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {datasets.map((ds: DatasetMetadata & { schema_type?: string }, i) => (
-                        <tr key={ds.id || i}>
-                          <td style={{ fontWeight: 500 }}>{ds.original_filename}</td>
-                          <td><code style={{ fontSize: 12, color: PURPLE }}>{ds.table_name}</code></td>
-                          <td>{ds.row_count?.toLocaleString() ?? "—"}</td>
-                          <td>{ds.columns?.length ?? "—"}</td>
-                          <td><SchemaTypeBadge type={ds.schema_type} /></td>
-                          <td>
-                            {ds.logical_dataset_name
-                              ? <span style={{ fontSize: 12, fontWeight: 600, color: ds.schema_type === "static" ? BLUE : GREEN }}>{ds.logical_dataset_name}</span>
-                              : <span style={{ color: "hsl(220 10% 45%)", fontSize: 12 }}>—</span>
-                            }
-                          </td>
-                          <td>
-                            <button onClick={() => deleteMutation.mutate(ds.id)} disabled={deleteMutation.isPending} style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}>
-                              <Trash2 size={13} /> Delete
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
+                      {datasets.map((ds: DatasetMetadata & { schema_type?: string }, i) => {
+                        const isChecked = checkedIds.has(ds.id);
+                        return (
+                          <tr
+                            key={ds.id || i}
+                            style={{ background: isChecked ? "rgba(239,68,68,0.05)" : undefined }}
+                          >
+                            <td style={{ paddingRight: 0 }}>
+                              <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={() => toggleCheck(ds.id)}
+                                  style={{
+                                    cursor: "pointer", width: 16, height: 16,
+                                    accentColor: "#f87171",
+                                  }}
+                                />
+                              </div>
+                            </td>
+                            <td style={{ fontWeight: 500 }}>{ds.original_filename}</td>
+                            <td><code style={{ fontSize: 12, color: PURPLE }}>{ds.table_name}</code></td>
+                            <td>{ds.row_count?.toLocaleString() ?? "—"}</td>
+                            <td>{ds.columns?.length ?? "—"}</td>
+                            <td><SchemaTypeBadge type={ds.schema_type} /></td>
+                            <td>
+                              {ds.logical_dataset_name
+                                ? <span style={{ fontSize: 12, fontWeight: 600, color: ds.schema_type === "static" ? BLUE : GREEN }}>{ds.logical_dataset_name}</span>
+                                : <span style={{ color: "hsl(220 10% 45%)", fontSize: 12 }}>—</span>
+                              }
+                            </td>
+                            <td>
+                              <button
+                                onClick={() => deleteMutation.mutate(ds.id)}
+                                disabled={deleteMutation.isPending || bulkDeleting}
+                                style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}
+                              >
+                                <Trash2 size={13} /> Delete
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

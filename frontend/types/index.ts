@@ -192,3 +192,99 @@ export interface CompositeView {
   sources: CompositeViewSource[];
   created_at?: string;
 }
+
+// ---- Post-Processing Analytics Pipeline ----
+
+export interface ColumnProfile {
+  column_name: string;
+  data_type: string | null;
+  row_count: number | null;
+  null_count: number | null;
+  null_pct: number | null;
+  distinct_count: number | null;
+  min_value: string | null;
+  max_value: string | null;
+  mean_value: number | null;
+  median_value: number | null;
+  std_dev: number | null;
+  top_values: { value: string; count: number }[];
+}
+
+export interface DatasetProfileResponse {
+  logical_dataset_id: string;
+  dataset_name: string;
+  computed_at: string;
+  columns: ColumnProfile[];
+}
+
+export interface DataAnomalyItem {
+  id: number;
+  column_name: string;
+  row_index: number | null;
+  value: string | null;
+  method: "zscore" | "iqr" | "rare_categorical";
+  reason: string | null;
+  severity: "low" | "medium" | "high";
+  computed_at: string;
+}
+
+export interface AnomalyResponse {
+  logical_dataset_id: string;
+  dataset_name: string;
+  total_anomalies: number;
+  anomalies: DataAnomalyItem[];
+}
+
+export interface TrendSeries {
+  value_column: string;
+  period: string;
+  direction: "up" | "down" | "flat";
+  slope: number | null;
+  r_squared: number | null;
+  series_data: { period: string; value: number }[];
+}
+
+export interface TrendResponse {
+  logical_dataset_id: string;
+  dataset_name: string;
+  has_time_data: boolean;
+  time_column: string | null;
+  trends: TrendSeries[];
+}
+
+export interface DatasetInsightResponse {
+  logical_dataset_id: string;
+  dataset_name: string;
+  narrative: string;
+  bullet_points: string[];
+  generated_at: string;
+  is_cached: boolean;
+}
+
+export interface PendingResponse {
+  status: "pending";
+  message: string;
+}
+
+// ---- Per-File Analytics ----
+export interface DatasetFileProfileResponse {
+  dataset_id: string;
+  file_name: string;
+  computed_at: string;
+  columns: ColumnProfile[];
+}
+
+export interface DatasetFileAnomalyResponse {
+  dataset_id: string;
+  file_name: string;
+  total_anomalies: number;
+  anomalies: DataAnomalyItem[];
+}
+
+export interface DatasetFileInsightResponse {
+  dataset_id: string;
+  file_name: string;
+  narrative: string;
+  bullet_points: string[];
+  generated_at: string;
+}

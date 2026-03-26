@@ -1,14 +1,15 @@
 "use client";
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ingestApi, analyticsApi } from "@/lib/api";
 import { useAppStore } from "@/store/useAppStore";
 import Header from "@/components/layout/Header";
+import InsightsPanel from "@/components/InsightsPanel";
 import type { PreviewData } from "@/types";
 import {
   Database, Layers, Loader2, Download, Eye, EyeOff,
   ChevronRight, ChevronDown, FolderOpen, FolderClosed,
-  FileSpreadsheet, File as FileIcon, Sparkles
+  FileSpreadsheet, File as FileIcon, Sparkles, BarChart2, Trash2
 } from "lucide-react";
 
 /* ──────────────────── Table Component ──────────────────── */
@@ -115,47 +116,143 @@ function SourceFilesList({
   logicalId,
   selectedFileId,
   onSelectFile,
+  onDeleteFiles,
 }: {
   logicalId: string;
   selectedFileId: string | null;
   onSelectFile: (f: SourceFile) => void;
+  onDeleteFiles: (deletedIds: string[]) => void;
 }) {
+  const queryClient = useQueryClient();
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
+  const [deleting, setDeleting] = useState(false);
+
   const { data: files, isLoading } = useQuery({
     queryKey: ["source-files", logicalId],
     queryFn: () => ingestApi.listSourceFiles(logicalId),
   });
 
+  const toggleCheck = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const handleDeleteSelected = async () => {
+    if (checkedIds.size === 0 || deleting) return;
+    setDeleting(true);
+    const ids = Array.from(checkedIds);
+    try {
+      await Promise.all(ids.map((id) => ingestApi.deleteDataset(id)));
+      setCheckedIds(new Set());
+      queryClient.invalidateQueries({ queryKey: ["source-files", logicalId] });
+      onDeleteFiles(ids);
+    } catch (err) {
+      console.error("Delete failed", err);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   if (isLoading) return <div style={{ padding: "6px 0 6px 28px" }}><Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} /></div>;
   if (!files || files.length === 0) return <p style={{ fontSize: 11, color: "hsl(220 10% 40%)", padding: "4px 0 4px 28px" }}>No files mapped yet.</p>;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 3, paddingLeft: 20, paddingTop: 4, paddingBottom: 4 }}>
-      {files.map((f) => (
-        <button
-          key={f.dataset_id}
-          onClick={() => onSelectFile(f)}
-          style={{
-            display: "flex", alignItems: "center", gap: 7, textAlign: "left",
-            padding: "7px 10px", borderRadius: 8, cursor: "pointer", border: "1px solid",
-            background: selectedFileId === f.dataset_id ? "rgba(96,165,250,0.12)" : "hsl(220 15% 8%)",
-            borderColor: selectedFileId === f.dataset_id ? "rgba(96,165,250,0.4)" : "hsl(220 15% 16%)",
-            transition: "all 0.12s",
-          }}
-        >
-          <FileSpreadsheet size={12} color={selectedFileId === f.dataset_id ? "#60a5fa" : "hsl(220 10% 45%)"} />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <p style={{ fontSize: 12, fontWeight: 600, color: "hsl(220 20% 85%)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 1 }}>
-              {f.file_name}
-            </p>
-            <p style={{ fontSize: 10, color: "hsl(220 10% 46%)" }}>
-              {f.row_count?.toLocaleString()} rows
-            </p>
-          </div>
-          {selectedFileId === f.dataset_id && (
-            <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#60a5fa", flexShrink: 0 }} />
-          )}
-        </button>
-      ))}
+    <div style={{ paddingLeft: 20, paddingTop: 4, paddingBottom: 4 }}>
+      {/* Delete toolbar — only shown when something is checked */}
+      {checkedIds.size > 0 && (
+        <div style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "6px 10px", marginBottom: 6, borderRadius: 8,
+          background: "rgba(239,68,68,0.07)", border: "1px solid rgba(239,68,68,0.25)",
+        }}>
+          <span style={{ fontSize: 11, color: "hsl(220 15% 65%)" }}>
+            {checkedIds.size} file{checkedIds.size > 1 ? "s" : ""} selected
+          </span>
+          <button
+            onClick={handleDeleteSelected}
+            disabled={deleting}
+            style={{
+              display: "flex", alignItems: "center", gap: 5, padding: "4px 10px",
+              borderRadius: 6, border: "1px solid rgba(239,68,68,0.4)",
+              background: "rgba(239,68,68,0.12)", color: "#f87171",
+              cursor: deleting ? "not-allowed" : "pointer", fontSize: 11, fontWeight: 600,
+              opacity: deleting ? 0.6 : 1,
+            }}
+          >
+            {deleting
+              ? <Loader2 size={11} style={{ animation: "spin 1s linear infinite" }} />
+              : <Trash2 size={11} />}
+            {deleting ? "Deleting…" : "Delete"}
+          </button>
+        </div>
+      )}
+
+      {/* File rows */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+        {files.map((f) => {
+          const isChecked = checkedIds.has(f.dataset_id);
+          const isViewing = selectedFileId === f.dataset_id;
+          return (
+            <div
+              key={f.dataset_id}
+              style={{
+                display: "flex", alignItems: "center", gap: 6,
+                padding: "7px 10px", borderRadius: 8, border: "1px solid",
+                background: isChecked
+                  ? "rgba(239,68,68,0.06)"
+                  : isViewing ? "rgba(96,165,250,0.12)" : "hsl(220 15% 8%)",
+                borderColor: isChecked
+                  ? "rgba(239,68,68,0.3)"
+                  : isViewing ? "rgba(96,165,250,0.4)" : "hsl(220 15% 16%)",
+                transition: "all 0.12s",
+              }}
+            >
+              {/* Checkbox */}
+              <div
+                onClick={(e) => toggleCheck(f.dataset_id, e)}
+                style={{
+                  width: 14, height: 14, borderRadius: 3, flexShrink: 0, cursor: "pointer",
+                  border: `1.5px solid ${isChecked ? "#f87171" : "hsl(220 15% 30%)"}`,
+                  background: isChecked ? "rgba(239,68,68,0.3)" : "transparent",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                }}
+              >
+                {isChecked && (
+                  <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+                    <path d="M1 4L3 6L7 2" stroke="#f87171" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                )}
+              </div>
+
+              {/* File info — click to view */}
+              <button
+                onClick={() => onSelectFile(f)}
+                style={{
+                  flex: 1, display: "flex", alignItems: "center", gap: 7, textAlign: "left",
+                  background: "transparent", border: "none", cursor: "pointer", minWidth: 0, padding: 0,
+                }}
+              >
+                <FileSpreadsheet size={12} color={isViewing ? "#60a5fa" : "hsl(220 10% 45%)"} style={{ flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <p style={{ fontSize: 12, fontWeight: 600, color: "hsl(220 20% 85%)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 1 }}>
+                    {f.file_name}
+                  </p>
+                  <p style={{ fontSize: 10, color: "hsl(220 10% 46%)" }}>
+                    {f.row_count?.toLocaleString()} rows
+                  </p>
+                </div>
+                {isViewing && !isChecked && (
+                  <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#60a5fa", flexShrink: 0 }} />
+                )}
+              </button>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -165,12 +262,14 @@ type ViewMode =
   | { type: "empty" }
   | { type: "raw"; datasetId: string }
   | { type: "unified"; logicalId: string }
-  | { type: "source-file"; datasetId: string; fileName: string };
+  | { type: "source-file"; datasetId: string; fileName: string; logicalId: string };
 
 export default function PreviewPage() {
   const { productId } = useAppStore();
   const [tab, setTab] = useState<"raw" | "logical">("raw");
   const [viewMode, setViewMode] = useState<ViewMode>({ type: "empty" });
+  // "data" shows the table; "insights" shows the analytics panel (only for unified logical datasets)
+  const [viewTab, setViewTab] = useState<"data" | "insights">("data");
   // Tracks which logical dataset folders are open
   const [expandedLogical, setExpandedLogical] = useState<Set<string>>(new Set());
   // Tracks preview mode for source-files
@@ -211,6 +310,16 @@ export default function PreviewPage() {
     : viewMode.type === "unified" ? loadingLogicalPreview
     : viewMode.type === "source-file" ? loadingRemapped
     : false;
+
+  // The logical dataset ID for the Insights panel — present for both unified and source-file views
+  const insightsLogicalId: string | null =
+    viewMode.type === "unified" ? viewMode.logicalId
+    : viewMode.type === "source-file" ? viewMode.logicalId
+    : null;
+
+  const insightsDatasetName: string | undefined = insightsLogicalId
+    ? (logicalDatasets?.find((ld) => ld.id === insightsLogicalId)?.dataset_name)
+    : undefined;
 
   const previewData = viewMode.type === "raw" ? rawPreview
     : viewMode.type === "unified" ? logicalPreview
@@ -268,7 +377,7 @@ export default function PreviewPage() {
                   (datasets ?? []).map((ds, i) => (
                     <button
                       key={ds.id || i}
-                      onClick={() => setViewMode({ type: "raw", datasetId: ds.id })}
+                      onClick={() => { setViewMode({ type: "raw", datasetId: ds.id }); setViewTab("data"); }}
                       style={{
                         display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left", marginBottom: 6,
                         padding: "9px 12px", borderRadius: 9, cursor: "pointer", border: "1px solid",
@@ -306,7 +415,7 @@ export default function PreviewPage() {
                         }}>
                           {/* Click group name → show unified preview */}
                           <button
-                            onClick={() => setViewMode({ type: "unified", logicalId: ld.id })}
+                            onClick={() => { setViewMode({ type: "unified", logicalId: ld.id }); setViewTab("data"); }}
                             style={{
                               flex: 1, display: "flex", alignItems: "center", gap: 8, textAlign: "left",
                               padding: "9px 10px", background: "transparent", border: "none", cursor: "pointer",
@@ -354,7 +463,12 @@ export default function PreviewPage() {
                             <SourceFilesList
                               logicalId={ld.id}
                               selectedFileId={viewMode.type === "source-file" ? (viewMode as any).datasetId : null}
-                              onSelectFile={(f) => setViewMode({ type: "source-file", datasetId: f.dataset_id, fileName: f.file_name })}
+                              onSelectFile={(f) => { setViewMode({ type: "source-file", datasetId: f.dataset_id, fileName: f.file_name, logicalId: ld.id }); setViewTab("data"); }}
+                              onDeleteFiles={(deletedIds) => {
+                                if (viewMode.type === "source-file" && deletedIds.includes((viewMode as any).datasetId)) {
+                                  setViewMode({ type: "unified", logicalId: ld.id });
+                                }
+                              }}
                             />
                           </div>
                         )}
@@ -370,7 +484,9 @@ export default function PreviewPage() {
             {/* Dynamic header */}
             <div style={{ marginBottom: 16, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                <h3 style={{ fontSize: 15, fontWeight: 700 }}>Data Preview</h3>
+                <h3 style={{ fontSize: 15, fontWeight: 700 }}>
+                  {insightsLogicalId && viewTab === "insights" ? "Insights" : "Data Preview"}
+                </h3>
                 {viewMode.type === "unified" && (
                   <span style={{ fontSize: 12, padding: "2px 10px", borderRadius: 999, background: "rgba(167,139,250,0.12)", border: "1px solid rgba(167,139,250,0.3)", color: "#c4b5fd" }}>
                     Unified View
@@ -383,35 +499,69 @@ export default function PreviewPage() {
                 )}
               </div>
 
-              {viewMode.type === "source-file" && (
-                <div style={{ display: "flex", background: "hsl(220 15% 10%)", borderRadius: 8, padding: 3, border: "1px solid hsl(220 15% 18%)" }}>
-                  <button
-                    onClick={() => setSourceMode("full")}
-                    style={{
-                      padding: "4px 12px", borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none",
-                      background: sourceMode === "full" ? "rgba(96,165,250,0.15)" : "transparent",
-                      color: sourceMode === "full" ? "#93c5fd" : "hsl(220 10% 50%)",
-                      transition: "all 0.15s"
-                    }}
-                  >
-                    Full Dataset
-                  </button>
-                  <button
-                    onClick={() => setSourceMode("mapped_only")}
-                    style={{
-                      padding: "4px 12px", borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none",
-                      background: sourceMode === "mapped_only" ? "rgba(167,139,250,0.15)" : "transparent",
-                      color: sourceMode === "mapped_only" ? "#c4b5fd" : "hsl(220 10% 50%)",
-                      transition: "all 0.15s"
-                    }}
-                  >
-                    Mapped Columns Only
-                  </button>
-                </div>
-              )}
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                {/* Data | Insights sub-tab switcher — for unified view AND source files */}
+                {insightsLogicalId && (
+                  <div style={{ display: "flex", background: "hsl(220 15% 10%)", borderRadius: 8, padding: 3, border: "1px solid hsl(220 15% 18%)" }}>
+                    <button
+                      onClick={() => setViewTab("data")}
+                      style={{
+                        padding: "4px 14px", borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none",
+                        background: viewTab === "data" ? "rgba(96,165,250,0.15)" : "transparent",
+                        color: viewTab === "data" ? "#93c5fd" : "hsl(220 10% 50%)",
+                        transition: "all 0.15s", display: "flex", alignItems: "center", gap: 5,
+                      }}
+                    >
+                      <Database size={11} /> Data
+                    </button>
+                    <button
+                      onClick={() => setViewTab("insights")}
+                      style={{
+                        padding: "4px 14px", borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none",
+                        background: viewTab === "insights" ? "rgba(167,139,250,0.15)" : "transparent",
+                        color: viewTab === "insights" ? "#c4b5fd" : "hsl(220 10% 50%)",
+                        transition: "all 0.15s", display: "flex", alignItems: "center", gap: 5,
+                      }}
+                    >
+                      <BarChart2 size={11} /> Insights
+                    </button>
+                  </div>
+                )}
+
+                {/* Full/Mapped toggle for source-file view */}
+                {viewMode.type === "source-file" && (
+                  <div style={{ display: "flex", background: "hsl(220 15% 10%)", borderRadius: 8, padding: 3, border: "1px solid hsl(220 15% 18%)" }}>
+                    <button
+                      onClick={() => setSourceMode("full")}
+                      style={{
+                        padding: "4px 12px", borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none",
+                        background: sourceMode === "full" ? "rgba(96,165,250,0.15)" : "transparent",
+                        color: sourceMode === "full" ? "#93c5fd" : "hsl(220 10% 50%)",
+                        transition: "all 0.15s"
+                      }}
+                    >
+                      Full Dataset
+                    </button>
+                    <button
+                      onClick={() => setSourceMode("mapped_only")}
+                      style={{
+                        padding: "4px 12px", borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none",
+                        background: sourceMode === "mapped_only" ? "rgba(167,139,250,0.15)" : "transparent",
+                        color: sourceMode === "mapped_only" ? "#c4b5fd" : "hsl(220 10% 50%)",
+                        transition: "all 0.15s"
+                      }}
+                    >
+                      Mapped Columns Only
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
 
-            {isLoading ? (
+            {/* ── Insights Tab ── */}
+            {insightsLogicalId && viewTab === "insights" ? (
+              <InsightsPanel logicalDatasetId={insightsLogicalId} datasetName={insightsDatasetName} datasetId={viewMode.type === "source-file" ? viewMode.datasetId : undefined} />
+            ) : isLoading ? (
               <div style={{ textAlign: "center", padding: "60px 20px", color: "hsl(220 10% 45%)" }}>
                 <Loader2 size={24} style={{ margin: "0 auto 10px", display: "block" }} />
                 Loading preview…
