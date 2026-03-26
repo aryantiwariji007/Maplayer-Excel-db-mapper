@@ -6,9 +6,14 @@ from .embedding import generate_embedding
 
 COLLECTION_NAME = "maplayer_schemas"
 VECTOR_SIZE = 384
-QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
-QDRANT_PORT = os.getenv("QDRANT_PORT", "6333")
-QDRANT_URL = os.getenv("QDRANT_URL", f"http://{QDRANT_HOST}:{QDRANT_PORT}")
+
+# Priority for Qdrant connection
+QDRANT_URL = os.getenv("QDRANT_URL")
+
+if not QDRANT_URL:
+    QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
+    QDRANT_PORT = os.getenv("QDRANT_PORT", "6333")
+    QDRANT_URL = f"http://{QDRANT_HOST}:{QDRANT_PORT}"
 
 try:
     print(f"Connecting to Qdrant at: {QDRANT_URL}")
