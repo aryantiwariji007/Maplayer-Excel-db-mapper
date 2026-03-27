@@ -13,7 +13,7 @@ app = FastAPI(title="MapLayer API", version="3.0")
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS", 
-    "http://localhost:3000,http://localhost:3001"
+    "http://localhost:3000,http://localhost:3001,https://backend-production-b6f9.up.railway.app"
 ).split(",")
 
 app.add_middleware(
