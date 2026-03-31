@@ -13,8 +13,9 @@ import {
 } from "recharts";
 import {
   Play, Loader2, Plus, Zap, Save, TrendingUp,
-  CheckSquare, Square, BarChart2, Sparkles, ChevronRight
+  CheckSquare, Square, BarChart2, Sparkles, ChevronRight, ArrowLeftRight
 } from "lucide-react";
+import QuoteComparison from "@/components/QuoteComparison";
 
 // Monaco editor lazy-loaded (heavy)
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
@@ -96,7 +97,7 @@ export default function AnalyticsPage() {
 
   const [sql, setSql] = useState("SELECT * FROM your_table LIMIT 50;");
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
-  const [activeTab, setActiveTab] = useState<"query" | "metrics">("query");
+  const [activeTab, setActiveTab] = useState<"query" | "metrics" | "compare">("query");
 
   // Metrics form
   const [metricName, setMetricName] = useState("");
@@ -198,19 +199,24 @@ export default function AnalyticsPage() {
       <div className="page-body">
         {/* Tab bar */}
         <div style={{ display: "flex", gap: 4, marginBottom: 20, background: "hsl(220 15% 10%)", borderRadius: 10, padding: 4, width: "fit-content" }}>
-          {(["query", "metrics"] as const).map((t, i) => (
+          {([
+            { key: "query", label: "SQL Query" },
+            { key: "metrics", label: "Metrics & AI" },
+            { key: "compare", label: "Compare", icon: <ArrowLeftRight size={12} style={{ display: "inline", marginRight: 5 }} /> },
+          ] as const).map((t) => (
             <button
-              key={t || i}
-              onClick={() => setActiveTab(t)}
+              key={t.key}
+              onClick={() => setActiveTab(t.key)}
               style={{
                 padding: "7px 20px", borderRadius: 7, border: "none", cursor: "pointer",
-                fontWeight: 600, fontSize: 13, textTransform: "capitalize",
-                background: activeTab === t ? "linear-gradient(135deg, rgba(167,139,250,0.2), rgba(96,165,250,0.15))" : "transparent",
-                color: activeTab === t ? PURPLE : "hsl(220 10% 50%)",
+                fontWeight: 600, fontSize: 13,
+                background: activeTab === t.key ? "linear-gradient(135deg, rgba(167,139,250,0.2), rgba(96,165,250,0.15))" : "transparent",
+                color: activeTab === t.key ? PURPLE : "hsl(220 10% 50%)",
                 transition: "all 0.12s",
+                display: "flex", alignItems: "center",
               }}
             >
-              {t === "query" ? "SQL Query" : "Metrics & AI"}
+              {t.icon}{t.label}
             </button>
           ))}
         </div>
@@ -578,6 +584,13 @@ export default function AnalyticsPage() {
               )}
             </div>
           </div>
+        )}
+
+        {activeTab === "compare" && (
+          <QuoteComparison
+            productId={productId}
+            logicalDatasets={logicalDatasets ?? []}
+          />
         )}
       </div>
     </>

@@ -484,8 +484,6 @@ async def ingest_upload_bulk(
     files: List[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
 ):
-    import os
-
     if not files:
         raise HTTPException(status_code=400, detail="Must provide at least one file (CSV, Excel, or ZIP)")
 
@@ -499,27 +497,28 @@ async def ingest_upload_bulk(
     db.commit()
     db.refresh(job)
 
-    # 2. Save uploaded files to temp directory using async reads
-    #    (shutil.copyfileobj is unsafe here — SpooledTemporaryFile pointer may be at EOF)
-    temp_dir = os.path.join("storage", "temp_uploads", job.id)
-    os.makedirs(temp_dir, exist_ok=True)
-
+    # 2. Read file content and encode as base64 to pass through the message broker
+    import os
+    import base64
+    files_data = []
     for f in files:
         content = await f.read()
         if not content:
             continue
         safe_filename = os.path.basename(f.filename or "upload")
-        target_path = os.path.join(temp_dir, safe_filename)
-        with open(target_path, "wb") as out:
-            out.write(content)
+        files_data.append({
+            "filename": safe_filename,
+            "content_b64": base64.b64encode(content).decode("utf-8"),
+        })
 
-    # 3. Dispatch Celery Task
+    # 3. Dispatch Celery Task with file data embedded in the message
     from ..celery_app import process_ingestion_job
     process_ingestion_job.delay(
         job_id=job.id,
         product_id=product_id,
         auto_map=auto_map,
         logical_dataset_name=logical_dataset_name,
+        files_data=files_data,
     )
 
     return {"status": "accepted", "job_id": job.id, "message": "Files queued for bulk processing."}
@@ -647,7 +646,17 @@ def create_logical_dataset(req: CreateLogicalDatasetRequest, db: Session = Depen
             LogicalDataset.dataset_name == req.dataset_name,
         )
     ).scalars().first()
+    
     if existing:
+        # Check if it has any mappings. If not, allow "re-creating" it (idempotent)
+        from ..models import LogicalDatasetMapping
+        mapping_count = db.execute(
+            select(func.count(LogicalDatasetMapping.id)).where(LogicalDatasetMapping.logical_dataset_id == existing.id)
+        ).scalar()
+        
+        if mapping_count == 0:
+            return {"id": existing.id, "dataset_name": existing.dataset_name, "table_name": existing.table_name, "created_at": existing.created_at}
+            
         raise HTTPException(status_code=400, detail="Logical dataset already exists")
 
     table_name = f"analytics_{str(uuid.uuid4()).replace('-', '_')}"
@@ -759,6 +768,143 @@ def list_all_schemas(product_id: str, db: Session = Depends(get_db)):
     return results
 
 
+@router.post("/schema/bulk-corrections")
+def bulk_save_corrections(
+    product_id: str = Form(...),
+    schema_name: str = Form(...),
+    column_mapping: Optional[str] = Form(None),
+    exclude_dataset_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Batch-save AI corrections for every dataset already mapped to a schema,
+    then re-materialize each dataset's rows in the analytics table with the
+    corrected column mapping.
+
+    If column_mapping (JSON string) is supplied, use it for all datasets instead
+    of each dataset's individually stored mapping.
+    exclude_dataset_id: skip this dataset during re-map (it was already handled
+    by a preceding mapDatasetToLogical call).
+    """
+    import json
+    from ..services.corrections import record_correction
+
+    # Find schema_id (static or dynamic) and logical_dataset_id for re-mapping
+    schema_id = None
+    logical_dataset_id_for_schema = None
+    static_schema = db.execute(
+        select(TargetSchema).where(
+            TargetSchema.product_id == product_id,
+            TargetSchema.schema_name == schema_name,
+        )
+    ).scalars().first()
+    if static_schema:
+        schema_id = str(static_schema.id)
+    else:
+        ld = db.execute(
+            select(LogicalDataset).where(
+                LogicalDataset.product_id == product_id,
+                LogicalDataset.dataset_name == schema_name,
+            )
+        ).scalars().first()
+        if ld:
+            schema_id = ld.id
+            logical_dataset_id_for_schema = ld.id
+
+    if not schema_id:
+        raise HTTPException(status_code=404, detail="Schema not found")
+
+    override_map = json.loads(column_mapping) if column_mapping else None
+
+    datasets = db.execute(
+        select(Dataset).where(
+            Dataset.product_id == product_id,
+            Dataset.mapped_schema_name == schema_name,
+        )
+    ).scalars().all()
+
+    saved_datasets = 0
+    saved_corrections = 0
+    for dataset in datasets:
+        if override_map is not None:
+            # Filter to only source columns that actually exist in this dataset
+            # Use normalized_name so keys match what perform_mapping/append_to_analytics_table expect
+            actual_cols = {
+                c.normalized_name for c in
+                db.execute(select(DatasetColumn).where(DatasetColumn.dataset_id == dataset.id)).scalars().all()
+            }
+            effective_map = {src: tgt for src, tgt in override_map.items() if src in actual_cols}
+            # Persist the corrected mapping so Preview uses it immediately
+            dataset.column_mapping = effective_map
+            db.add(dataset)
+        else:
+            effective_map = dataset.column_mapping or {}
+
+        if not effective_map:
+            continue
+
+        for src, tgt in effective_map.items():
+            if src and tgt and tgt != "- skip -":
+                record_correction(
+                    db=db,
+                    product_id=product_id,
+                    schema_id=schema_id,
+                    source_column=src,
+                    correct_target=tgt,
+                )
+                saved_corrections += 1
+        saved_datasets += 1
+
+    db.commit()
+
+    # --- Re-materialize all other datasets with the corrected mapping ---
+    remapped_count = 0
+    if override_map:
+        for dataset in datasets:
+            if dataset.id == exclude_dataset_id:
+                continue  # Already handled by the preceding mapDatasetToLogical call
+
+            # Resolve which logical dataset to write rows into
+            ldm = db.execute(
+                select(LogicalDatasetMapping).where(LogicalDatasetMapping.dataset_id == dataset.id)
+            ).scalars().first()
+            target_ld_id = ldm.logical_dataset_id if ldm else logical_dataset_id_for_schema
+            if not target_ld_id:
+                continue
+
+            # Build effective map using normalized column names for this dataset
+            actual_cols = {
+                c.normalized_name for c in
+                db.execute(select(DatasetColumn).where(DatasetColumn.dataset_id == dataset.id)).scalars().all()
+            }
+            eff = {
+                src: tgt for src, tgt in override_map.items()
+                if src in actual_cols and tgt and tgt.strip() and tgt != "- skip -"
+            }
+            if not eff:
+                continue
+
+            try:
+                req = MapDatasetRequest(
+                    dataset_id=dataset.id,
+                    logical_dataset_id=target_ld_id,
+                    column_mapping=eff,
+                    auto_map=False,
+                )
+                perform_mapping(req, db)
+                remapped_count += 1
+            except Exception as e:
+                print(f"DEBUG: bulk re-map failed for dataset {dataset.id}: {e}")
+                db.rollback()
+                continue
+
+    return {
+        "saved_datasets": saved_datasets,
+        "saved_corrections": saved_corrections,
+        "remapped_datasets": remapped_count,
+        "schema_name": schema_name,
+    }
+
+
 @router.get("/datasets/{dataset_id}/mapping-history")
 def get_mapping_history(dataset_id: str, db: Session = Depends(get_db)):
     """Return all past mapping versions for a dataset, newest first."""
@@ -826,20 +972,47 @@ def preview_dataset_remapped(dataset_id: str, mode: str = "full", db: Session = 
     if not col_map:
         return sanitize_nans(raw)
     
+    # Build a set of valid target schema keys so mapped_only can filter to real schema columns
+    schema_keys = None
+    if mode == "mapped_only" and dataset.mapped_schema_name:
+        if dataset.schema_type == "static":
+            static_schema = db.execute(
+                select(TargetSchema).where(
+                    TargetSchema.product_id == dataset.product_id,
+                    TargetSchema.schema_name == dataset.mapped_schema_name,
+                )
+            ).scalars().unique().first()
+            if static_schema:
+                schema_keys = {c.key for c in static_schema.columns}
+        else:
+            ld = db.execute(
+                select(LogicalDataset).where(
+                    LogicalDataset.product_id == dataset.product_id,
+                    LogicalDataset.dataset_name == dataset.mapped_schema_name,
+                )
+            ).scalars().first()
+            if ld:
+                from ..services.similarity import get_logical_schema_columns
+                schema_keys = set(get_logical_schema_columns(db, ld.id))
+
     if mode == "mapped_only":
         remapped_columns = []
         for c in raw["columns"]:
-            if c in col_map and col_map[c] and col_map[c] != "- skip -":
-                remapped_columns.append(col_map[c])
-                
+            tgt = col_map.get(c)
+            if tgt and tgt != "- skip -":
+                if schema_keys is None or tgt in schema_keys:
+                    remapped_columns.append(tgt)
+
         remapped_rows = []
         for row in raw["rows"]:
             remapped_row = {}
             for src_col, val in row.items():
-                if src_col in col_map and col_map[src_col] and col_map[src_col] != "- skip -":
-                    remapped_row[col_map[src_col]] = val
+                tgt = col_map.get(src_col)
+                if tgt and tgt != "- skip -":
+                    if schema_keys is None or tgt in schema_keys:
+                        remapped_row[tgt] = val
             remapped_rows.append(remapped_row)
-            
+
         return sanitize_nans({"columns": remapped_columns, "rows": remapped_rows})
 
     else:

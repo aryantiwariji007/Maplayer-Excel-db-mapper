@@ -269,11 +269,14 @@ def discover_metrics(target_id: str, target_type: str = "logical", db: Session =
     sample_data = sample_res["rows"]
 
     # 3. Call Gemini to suggest metrics
-    suggestions = discover_metrics_with_ai(
-        dataset_name=dataset_name,
-        columns=all_cols,
-        sample_data=sample_data
-    )
+    try:
+        suggestions = discover_metrics_with_ai(
+            dataset_name=dataset_name,
+            columns=all_cols,
+            sample_data=sample_data
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI metric discovery failed: {str(e)}")
 
     return {
         "target_id": target_id,
@@ -605,3 +608,173 @@ def get_dataset_file_insight(dataset_id: str, db: Session = Depends(get_db)):
         "bullet_points": insight.bullet_points or [],
         "generated_at": insight.generated_at.isoformat() if insight.generated_at else None,
     }
+
+
+# ── Quote / Value Comparison Engine ──────────────────────────────────────────
+
+class CompareRequest(BaseModel):
+    group_by: list[str]           # key columns to group rows by, e.g. ["size", "type"]
+    pivot_on: str                 # dimension to compare across, e.g. "source_file" or "vendor"
+    value_columns: list[str]      # columns to compare, e.g. ["price", "lead_time"]
+    aggregation: str = "first"    # "first" | "min" | "max" | "avg"
+    search: Optional[str] = None  # filter key rows by this string
+    limit: int = 5000
+
+
+@router.post("/logical-datasets/{logical_dataset_id}/compare")
+def compare_logical_dataset(
+    logical_dataset_id: str,
+    req: CompareRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Return a pivot/comparison table from a logical dataset.
+
+    Groups rows by `group_by` columns, pivots on `pivot_on` dimension,
+    aggregates `value_columns` per cell. Works for any multi-source comparison
+    (vendor quotes, regional sales, lab results, etc.).
+    """
+    from collections import defaultdict, OrderedDict
+
+    ld = db.execute(
+        select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)
+    ).scalars().first()
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found")
+
+    # Fetch rows — include source_file via join so users can pivot on it
+    sql = f"""
+        SELECT d.file_name AS source_file, t.*
+        FROM "{ld.table_name}" t
+        LEFT JOIN datasets d ON t.dataset_id = d.id
+        LIMIT {min(req.limit, 10000)}
+    """
+    try:
+        result = query_dataset(engine, sql)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to query dataset: {str(e)}")
+
+    rows = result.get("rows", [])
+    if not rows:
+        return sanitize_nans({
+            "group_by": req.group_by,
+            "pivot_on": req.pivot_on,
+            "pivot_values": [],
+            "value_columns": req.value_columns,
+            "aggregation": req.aggregation,
+            "rows": [],
+            "row_count": 0,
+            "missing_coverage": {},
+        })
+
+    # Apply search filter across group_by + pivot_on columns
+    if req.search:
+        s = req.search.lower()
+        rows = [
+            row for row in rows
+            if any(
+                s in str(row.get(col, "") or "").lower()
+                for col in req.group_by + [req.pivot_on]
+            )
+        ]
+
+    # Pivot: key_tuple → pivot_value → value_col → [raw values]
+    key_to_pivot: "OrderedDict[tuple, dict]" = OrderedDict()
+    key_to_dict: "dict[tuple, dict]" = {}
+
+    for row in rows:
+        key_tuple = tuple(str(row.get(col, "") or "") for col in req.group_by)
+        pivot_val = str(row.get(req.pivot_on, "") or "").strip() or "(unknown)"
+
+        if key_tuple not in key_to_pivot:
+            key_to_pivot[key_tuple] = defaultdict(lambda: defaultdict(list))
+            key_to_dict[key_tuple] = {col: str(row.get(col, "") or "") for col in req.group_by}
+
+        for vc in req.value_columns:
+            val = row.get(vc)
+            if val is not None and str(val).strip() not in ("", "None", "null"):
+                key_to_pivot[key_tuple][pivot_val][vc].append(val)
+
+    # Collect pivot dimension values in sorted order
+    seen_pv: "set[str]" = set()
+    pivot_values: "list[str]" = []
+    for pivot_dict in key_to_pivot.values():
+        for pv in pivot_dict:
+            if pv not in seen_pv:
+                pivot_values.append(pv)
+                seen_pv.add(pv)
+    pivot_values.sort()
+
+    def _agg(vals: list, agg: str):
+        if not vals:
+            return None
+        numeric = []
+        for v in vals:
+            try:
+                numeric.append(float(v))
+            except (ValueError, TypeError):
+                pass
+        if agg == "first":
+            return vals[0]
+        if numeric:
+            if agg == "min":
+                return min(numeric)
+            if agg == "max":
+                return max(numeric)
+            if agg == "avg":
+                return round(sum(numeric) / len(numeric), 4)
+        return vals[0]
+
+    result_rows = []
+    for key_tuple, pivot_dict in key_to_pivot.items():
+        # Aggregate values per (pivot_value, value_col) cell
+        values: "dict[str, dict]" = {}
+        for pv in pivot_values:
+            vc_map = pivot_dict.get(pv, {})
+            values[pv] = {
+                vc: _agg(list(vc_map.get(vc, [])), req.aggregation)
+                for vc in req.value_columns
+            }
+
+        # Determine best pivot value per value column (for numeric columns)
+        best: "dict[str, str]" = {}
+        for vc in req.value_columns:
+            entries = []
+            for pv, vc_vals in values.items():
+                v = vc_vals.get(vc)
+                if v is not None:
+                    try:
+                        entries.append((pv, float(v)))
+                    except (ValueError, TypeError):
+                        pass
+            if len(entries) > 1:
+                # max aggregation → higher is better; everything else → lower is better
+                winner = max(entries, key=lambda x: x[1]) if req.aggregation == "max" else min(entries, key=lambda x: x[1])
+                best[vc] = winner[0]
+
+        result_rows.append({
+            "key": key_to_dict[key_tuple],
+            "values": values,
+            "best": best,
+        })
+
+    # Coverage gaps: how many key rows a given pivot value is missing entirely
+    missing_coverage: "dict[str, int]" = {}
+    for pv in pivot_values:
+        missing = sum(
+            1 for row in result_rows
+            if all(row["values"].get(pv, {}).get(vc) is None for vc in req.value_columns)
+        )
+        if missing:
+            missing_coverage[pv] = missing
+
+    return sanitize_nans({
+        "group_by": req.group_by,
+        "pivot_on": req.pivot_on,
+        "pivot_values": pivot_values,
+        "value_columns": req.value_columns,
+        "aggregation": req.aggregation,
+        "rows": result_rows,
+        "row_count": len(result_rows),
+        "missing_coverage": missing_coverage,
+    })

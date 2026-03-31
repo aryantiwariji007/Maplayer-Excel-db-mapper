@@ -41,7 +41,7 @@ def prepare_ingestion_items(temp_dir: str) -> list[dict]:
                     for info in z.infolist():
                         if info.is_dir() or info.filename.startswith("__MACOSX") or info.filename.split("/")[-1].startswith("."):
                             continue
-                        if not (info.filename.lower().endswith('.csv') or info.filename.lower().endswith('.xls') or info.filename.lower().endswith('.xlsx')):
+                        if not (info.filename.lower().endswith('.csv') or info.filename.lower().endswith('.xls') or info.filename.lower().endswith('.xlsx') or info.filename.lower().endswith('.xlsm')):
                             continue
                         
                         extracted_content = z.read(info.filename)
@@ -74,25 +74,30 @@ def process_single_ingestion_item(
     file_content: bytes,
     product_id: str,
     auto_map: bool,
-    logical_dataset_name: str = None
+    logical_dataset_name: str = None,
+    sheet_name: str = None,
 ) -> dict:
     """
-    Ingests a single file into the system.
-    This is the core logic that can be run in parallel.
+    Ingests a single file (or a specific sheet of an Excel file) into the system.
+    sheet_name: if set, only that Excel sheet is parsed and the dataset is labelled
+                as "filename [SheetName]" so each sheet becomes a separate dataset.
     """
     from .schema_resolver import resolve_best_schema, SchemaMatch
     from .materialization import ensure_static_table, ensure_dynamic_table, append_rows
     from .schema_inference import infer_schema, pg_type
     from .dataset_store import create_dataset_table, insert_dataset_rows, drop_dataset_table
 
+    # Build the display name shown in the UI
+    display_filename = f"{filename} [{sheet_name}]" if sheet_name else filename
+
     try:
         # Step 1 — Parse file
-        df = load_dataframe(file_content, filename)
+        df = load_dataframe(file_content, filename, sheet_name=sheet_name)
         if df.empty or len(df.columns) == 0:
             raise Exception("File contains no usable data")
 
-        # Step 2 — Infer schema
-        schema_meta = infer_schema(df, product_id, filename)
+        # Step 2 — Infer schema (use display_filename so table names are unique per sheet)
+        schema_meta = infer_schema(df, product_id, display_filename)
         dataset_meta = schema_meta["dataset"]
         columns_meta = schema_meta["columns"]
 
@@ -224,7 +229,7 @@ def process_single_ingestion_item(
             "rows": rows_inserted,
             "columns": [{"name": c["normalized_name"], "type": c["data_type"]} for c in columns_meta],
             "status": "success",
-            "file_name": filename,
+            "file_name": display_filename,
             "auto_mapped": auto_mapped,
             "schema_type": schema_type,
             "mapped_to": mapped_schema_name,
@@ -237,8 +242,8 @@ def process_single_ingestion_item(
 
     except Exception as e:
         import traceback
-        print(f"Ingestion error for {filename}: {e}\n{traceback.format_exc()}")
-        return {"file_name": filename, "status": "error", "error": str(e)}
+        print(f"Ingestion error for {display_filename}: {e}\n{traceback.format_exc()}")
+        return {"file_name": display_filename, "status": "error", "error": str(e)}
 
 def run_bulk_ingestion_workflow(
     db: Session,

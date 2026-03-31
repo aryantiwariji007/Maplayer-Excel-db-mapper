@@ -60,14 +60,14 @@ export default function MappingPage() {
           newMap[src as string] = tgt;
         });
         setMappingDraft({ columnMappings: newMap });
-        
+
         // Auto-select the schema so target keys appear immediately
         if (data.logical_dataset_id && data.detected_schema) {
           const tempSchema = {
-             id: data.logical_dataset_id,
-             schema_name: data.detected_schema,
-             schema_type: "dynamic" as const,
-             columns: Object.keys(data.target_to_source_map).map(k => ({ key: k, data_type: "text" }))
+            id: data.logical_dataset_id,
+            schema_name: data.detected_schema,
+            schema_type: "dynamic" as const,
+            columns: Object.keys(data.target_to_source_map).map(k => ({ key: k, data_type: "text" }))
           } as TargetSchemaResponse;
           setMappingDraft({ selectedSchemaId: String(tempSchema.id) });
         }
@@ -81,46 +81,55 @@ export default function MappingPage() {
   const confirmMutation = useMutation({
     mutationFn: async (mappings: Record<string, string>) => {
       if (!selectedSchema) {
-         throw new Error("Please select a Target Schema from the right panel to save corrections to it.");
+        throw new Error("Please select a Target Schema from the right panel to save corrections to it.");
       }
       if (!selectedDataset) {
-         throw new Error("No dataset selected.");
+        throw new Error("No dataset selected.");
       }
-      
-      // 1. Re-map the dataset and materialize the new columns
-      await ingestApi.mapDatasetToLogical(
+
+      // 1. Re-map the dataset and materialize the new columns (dynamic schemas only)
+      if (selectedSchema.schema_type !== "static") {
+        await ingestApi.mapDatasetToLogical(
           selectedDataset.id,
           selectedSchema.id as string,
           false,
           mappings
-      );
-      
-      // 2. Record individual corrections for AI
-      const promises = Object.entries(mappings).map(([src, tgt]) => {
-          if (tgt) {
-              return mapApi.confirm({
-                product_id: productId,
-                schema_name: selectedSchema.schema_name,
-                source_column: src,
-                correct_target_key: tgt,
-              }).catch(e => console.warn("Failed to record correction for", src, ":", e));
-          }
-      });
-      await Promise.all(promises);
-      
-      return true;
+        );
+      }
+
+      // 2. Propagate corrections and re-materialize all other files in this schema
+      const bulkResult = await ingestApi.bulkSaveCorrections(productId, selectedSchema.schema_name, mappings, selectedDataset.id);
+
+      return bulkResult;
     },
-    onSuccess: () => {
-        toast.success("Mapping correction saved and data re-processed!");
-        qc.invalidateQueries({ queryKey: ["datasets", productId] });
+    onSuccess: (data: any, mappings) => {
+      const count = Object.values(mappings).filter(Boolean).length;
+      const remapped = data?.remapped_datasets ?? 0;
+      const msg = remapped > 0
+        ? `Corrections saved & ${remapped} file(s) re-mapped in "${selectedSchema?.schema_name}" (${count} mappings)`
+        : `Corrections saved for "${selectedSchema?.schema_name}" (${count} mappings applied)`;
+      toast.success(msg);
+      qc.invalidateQueries({ queryKey: ["datasets", productId] });
     },
     onError: (err: Error) => toast.error(err.message || "Failed to save correction"),
+  });
+
+  const saveAllM = useMutation({
+    mutationFn: async (schema: TargetSchemaResponse) => {
+      return ingestApi.bulkSaveCorrections(productId, schema.schema_name);
+    },
+    onSuccess: (data) => {
+      toast.success(
+        `Auto-saved corrections for ${data.saved_datasets} file${data.saved_datasets !== 1 ? "s" : ""} in "${data.schema_name}"`
+      );
+    },
+    onError: (err: Error) => toast.error(err.message || "Failed to save corrections"),
   });
 
   const deleteSchemaM = useMutation({
     mutationFn: (schema: TargetSchemaResponse) => {
       if (schema.schema_type === "dynamic") {
-         return ingestApi.deleteLogicalDataset(schema.id as string);
+        return ingestApi.deleteLogicalDataset(schema.id as string);
       }
       return schemasApi.delete(schema.id as number);
     },
@@ -150,7 +159,11 @@ export default function MappingPage() {
       setNewSchemaName("");
       setNewSchemaColumns([{ key: "", data_type: "text", description: "" }]);
     },
-    onError: () => toast.error("Failed to create schema"),
+    onError: (err: any) => {
+      const msg = err?.response?.data?.detail || err?.message || "Unknown error";
+      toast.error(`Failed to create schema: ${msg}`);
+      console.error("Schema creation error:", err?.response?.data || err);
+    },
   });
 
   const sourceColumns = selectedDataset?.columns ?? [];
@@ -396,12 +409,22 @@ export default function MappingPage() {
                   >
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                       <span style={{ fontSize: 13, fontWeight: 600, color: "hsl(220 20% 86%)" }}>{schema.schema_name}</span>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); deleteSchemaM.mutate(schema); }}
-                        style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", display: "flex" }}
-                      >
-                        <Trash2 size={12} />
-                      </button>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                        <button
+                          title="Auto-save corrections for all files in this schema"
+                          onClick={(e) => { e.stopPropagation(); saveAllM.mutate(schema); }}
+                          disabled={saveAllM.isPending}
+                          style={{ background: "none", border: "none", cursor: "pointer", color: "#a78bfa", display: "flex" }}
+                        >
+                          {saveAllM.isPending ? <Loader2 size={12} /> : <RefreshCw size={12} />}
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); deleteSchemaM.mutate(schema); }}
+                          style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", display: "flex" }}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
                     </div>
                     <p style={{ fontSize: 11, color: "hsl(220 10% 50%)", marginTop: 3 }}>
                       {schema.columns.length} columns

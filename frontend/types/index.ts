@@ -28,28 +28,39 @@ export interface TargetSchemaCreate {
 }
 
 // ---- Datasets ----
+export interface DatasetColumn {
+  column_name: string;
+  normalized_name?: string;
+  data_type?: string;
+}
+
 export interface DatasetMetadata {
   id: string;
   product_id: string;
   original_filename: string;
   table_name: string;
   row_count: number;
-  columns: string[];
+  columns: (string | DatasetColumn)[];
   created_at: string;
   logical_dataset_id?: string;
   logical_dataset_name?: string;
 }
 
 export interface UploadResult {
-  filename: string;
+  file_name?: string;
+  filename?: string;        // legacy alias
   status: "success" | "error";
   dataset_id?: string;
   table_name?: string;
-  columns?: string[];
-  row_count?: number;
-  auto_map_result?: MappingResult;
+  columns?: { name: string; type: string }[];
+  rows?: number;
+  row_count?: number;       // legacy alias
   auto_mapped?: boolean;
+  schema_type?: "static" | "dynamic" | null;
   mapped_to?: string;
+  mapped_schema_id?: string;
+  match_confidence?: number;
+  column_mapping?: Record<string, string>;
   error?: string;
 }
 
@@ -287,4 +298,31 @@ export interface DatasetFileInsightResponse {
   narrative: string;
   bullet_points: string[];
   generated_at: string;
+}
+
+// ---- Quote / Value Comparison ----
+export interface CompareRequest {
+  group_by: string[];
+  pivot_on: string;
+  value_columns: string[];
+  aggregation?: "first" | "min" | "max" | "avg";
+  search?: string;
+  limit?: number;
+}
+
+export interface CompareRow {
+  key: Record<string, string>;
+  values: Record<string, Record<string, unknown>>;
+  best: Record<string, string>;
+}
+
+export interface CompareResponse {
+  group_by: string[];
+  pivot_on: string;
+  pivot_values: string[];
+  value_columns: string[];
+  aggregation: string;
+  rows: CompareRow[];
+  row_count: number;
+  missing_coverage: Record<string, number>;
 }

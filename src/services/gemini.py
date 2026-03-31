@@ -212,51 +212,42 @@ def discover_metrics_with_ai(dataset_name, columns, sample_data):
     """
     Suggest business metrics based on a dataset's columns and sample data.
     Returns a list of suggested metrics with SQL expressions.
+    Raises on failure so the caller can surface a proper HTTP error.
     """
     if not GEMINI_API_KEY:
-        return []
-    
-    try:
-        model = genai.GenerativeModel('gemini-3-flash-preview')
-        
-        prompt = f"""
-        You are a world-class Business Intelligence and Data Analyst.
-        Given the following dataset schema and sample data, suggest 5-8 highly relevant business metrics.
-        
-        Dataset Name: {dataset_name}
-        
-        Schema (Column Names and Types):
-        {json.dumps(columns, indent=2)}
-        
-        Sample Data:
-        {json.dumps(sample_data, indent=2, cls=DateTimeEncoder)}
-        
-        Instructions:
-        1. Each metric must be a valid PostgreSQL SQL aggregate expression (e.g., 'SUM(revenue)', 'COUNT(DISTINCT user_id)', 'AVG(price)').
-        2. Focus on metrics that provide business value (Growth, Efficiency, Volume, etc.).
-        3. Ensure the SQL expressions only use columns that exist in the schema.
-        
-        Respond ONLY with a valid JSON array of objects. Each object must have:
-        - "metric_name": A clear, professional name for the metric.
-        - "sql_expression": The SQL aggregate expression.
-        - "description": A brief explanation of what this metric represents.
-        
-        Example Output:
-        [
-            {{ "metric_name": "Total Revenue", "sql_expression": "SUM(revenue)", "description": "Total sum of all transaction revenue." }}
-        ]
-        """
-        
-        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
-        print(f"Gemini Discovery Response: {response.text}")
-        return json.loads(response.text)
-    except Exception as e:
-        print(f"Gemini Metric Discovery Error: {e}")
-        # Log the full response if possible
-        try:
-            if 'response' in locals():
-                print(f"Full response object: {response}")
-        except:
-            pass
-        return []
+        raise RuntimeError("GEMINI_API_KEY is not configured on the server.")
+
+    model = genai.GenerativeModel('gemini-3-flash-preview')
+
+    prompt = f"""
+    You are a world-class Business Intelligence and Data Analyst.
+    Given the following dataset schema and sample data, suggest 5-8 highly relevant business metrics.
+
+    Dataset Name: {dataset_name}
+
+    Schema (Column Names and Types):
+    {json.dumps(columns, indent=2)}
+
+    Sample Data:
+    {json.dumps(sample_data, indent=2, cls=DateTimeEncoder)}
+
+    Instructions:
+    1. Each metric must be a valid PostgreSQL SQL aggregate expression (e.g., 'SUM(revenue)', 'COUNT(DISTINCT user_id)', 'AVG(price)').
+    2. Focus on metrics that provide business value (Growth, Efficiency, Volume, etc.).
+    3. Ensure the SQL expressions only use columns that exist in the schema.
+
+    Respond ONLY with a valid JSON array of objects. Each object must have:
+    - "metric_name": A clear, professional name for the metric.
+    - "sql_expression": The SQL aggregate expression.
+    - "description": A brief explanation of what this metric represents.
+
+    Example Output:
+    [
+        {{ "metric_name": "Total Revenue", "sql_expression": "SUM(revenue)", "description": "Total sum of all transaction revenue." }}
+    ]
+    """
+
+    response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+    print(f"Gemini Discovery Response: {response.text}")
+    return json.loads(response.text)
 

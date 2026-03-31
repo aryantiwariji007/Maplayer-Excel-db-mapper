@@ -506,17 +506,17 @@ function FileInsightsSection({ datasetId }: { datasetId: string }) {
                   .filter(a => a.severity !== "low")
                   .slice(0, 10)
                   .map((a) => (
-                  <tr key={a.id} style={{ background: rowBg(a.severity), borderTop: "1px solid hsl(220 15% 15%)" }}>
-                    <td style={{ padding: "6px 10px", color: "hsl(220 20% 80%)", fontFamily: "monospace" }}>{a.column_name}</td>
-                    <td style={{ padding: "6px 10px", color: "hsl(220 20% 75%)", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.value}</td>
-                    <td style={{ padding: "6px 10px", color: "hsl(220 10% 50%)" }}>{a.method}</td>
-                    <td style={{ padding: "6px 10px" }}>
-                      <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 999, fontWeight: 700, ...severityStyle(a.severity) }}>
-                        {a.severity}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                    <tr key={a.id} style={{ background: rowBg(a.severity), borderTop: "1px solid hsl(220 15% 15%)" }}>
+                      <td style={{ padding: "6px 10px", color: "hsl(220 20% 80%)", fontFamily: "monospace" }}>{a.column_name}</td>
+                      <td style={{ padding: "6px 10px", color: "hsl(220 20% 75%)", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.value}</td>
+                      <td style={{ padding: "6px 10px", color: "hsl(220 10% 50%)" }}>{a.method}</td>
+                      <td style={{ padding: "6px 10px" }}>
+                        <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 999, fontWeight: 700, ...severityStyle(a.severity) }}>
+                          {a.severity}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
               </tbody>
             </table>
           </div>

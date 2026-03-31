@@ -1,4 +1,5 @@
 import uuid
+import threading
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -58,11 +59,13 @@ def create_schema(schema: TargetSchemaCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_schema)
     
-    # Sync with Qdrant
-    try:
-        sync_schema_embeddings(db_schema.id, db_schema.columns)
-    except Exception as e:
-        print(f"Warning: Failed to sync embeddings immediately: {e}")
+    # Sync with Qdrant in background to avoid blocking the response
+    schema_id = db_schema.id
+    columns_snapshot = list(db_schema.columns)
+    threading.Thread(
+        target=lambda: sync_schema_embeddings(schema_id, columns_snapshot),
+        daemon=True
+    ).start()
 
     return db_schema
 

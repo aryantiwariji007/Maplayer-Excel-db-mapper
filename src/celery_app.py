@@ -27,14 +27,48 @@ app.conf.update(
     enable_utc=True,
 )
 
+def _expand_excel_sheets(filename: str, content: bytes) -> list:
+    """
+    For Excel files with multiple sheets, returns one task item per sheet.
+    For CSV files (or single-sheet Excel), returns a single item with no sheet_name.
+    """
+    import base64
+    if not (filename.lower().endswith('.xlsx') or filename.lower().endswith('.xls') or filename.lower().endswith('.xlsm')):
+        return [{"filename": filename, "content_b64": base64.b64encode(content).decode("utf-8")}]
+
+    try:
+        from .services.data_processor import get_excel_sheet_names
+        sheet_names = get_excel_sheet_names(content)
+    except Exception as e:
+        print(f"Could not read sheet names from {filename}: {e}")
+        return [{"filename": filename, "content_b64": base64.b64encode(content).decode("utf-8")}]
+
+    if len(sheet_names) <= 1:
+        return [{"filename": filename, "content_b64": base64.b64encode(content).decode("utf-8")}]
+
+    content_b64 = base64.b64encode(content).decode("utf-8")
+    items = []
+    for sheet in sheet_names:
+        items.append({
+            "filename": filename,
+            "content_b64": content_b64,
+            "sheet_name": sheet,
+        })
+    print(f"DEBUG: Expanded '{filename}' into {len(items)} sheet(s): {sheet_names}")
+    return items
+
+
 @app.task(bind=True)
-def process_ingestion_job(self, job_id: str, product_id: str, auto_map: bool, logical_dataset_name: str = None):
+def process_ingestion_job(self, job_id: str, product_id: str, auto_map: bool, logical_dataset_name: str = None, files_data: list = None):
     """
     Dispatcher task:
-    1. Expands all files (including Zips).
-    2. Saves them to a temporary 'processed' folder.
-    3. Spawns parallel sub-tasks for each file.
+    1. Expands all files (including ZIPs) from the base64-encoded message data.
+    2. Spawns parallel sub-tasks for each file.
     """
+    import base64
+    import zipfile
+    import io
+
     db: Session = SessionLocal()
     job = db.query(UploadJob).filter(UploadJob.id == job_id).first()
     if not job:
@@ -45,12 +79,29 @@ def process_ingestion_job(self, job_id: str, product_id: str, auto_map: bool, lo
         job.status = "PROCESSING"
         db.commit()
 
-        from .services.ingestion_service import prepare_ingestion_items
-        temp_dir = os.path.join("storage", "temp_uploads", job_id)
-        processed_dir = os.path.join(temp_dir, "processed")
-        os.makedirs(processed_dir, exist_ok=True)
+        # Expand files from message data (including ZIP extraction)
+        items = []
+        for file_data in (files_data or []):
+            filename = file_data["filename"]
+            content = base64.b64decode(file_data["content_b64"])
 
-        items = prepare_ingestion_items(temp_dir)
+            if filename.lower().endswith(".zip"):
+                try:
+                    with zipfile.ZipFile(io.BytesIO(content)) as z:
+                        for info in z.infolist():
+                            if info.is_dir() or info.filename.startswith("__MACOSX") or info.filename.split("/")[-1].startswith("."):
+                                continue
+                            if not (info.filename.lower().endswith('.csv') or info.filename.lower().endswith('.xls') or info.filename.lower().endswith('.xlsx') or info.filename.lower().endswith('.xlsm')):
+                                continue
+                            extracted = z.read(info.filename)
+                            if extracted:
+                                base_name = info.filename.split("/")[-1]
+                                items.extend(_expand_excel_sheets(base_name, extracted))
+                except Exception as e:
+                    print(f"Error extracting zip {filename}: {e}")
+            else:
+                items.extend(_expand_excel_sheets(filename, content))
+
         if not items:
             job.status = "COMPLETED"
             job.results = []
@@ -61,28 +112,15 @@ def process_ingestion_job(self, job_id: str, product_id: str, auto_map: bool, lo
         job.total_files = len(items)
         db.commit()
 
-        # Save extracted items to disk for parallel workers to read (avoids large broker payloads)
-        task_items = []
-        for i, item in enumerate(items):
-            safe_name = f"item_{i}_{item['filename']}"
-            item_path = os.path.join(processed_dir, safe_name)
-            with open(item_path, "wb") as f:
-                f.write(item['content'])
-            
-            task_items.append({
-                "filename": item['filename'],
-                "disk_path": item_path
-            })
-
-        # Dispatch parallel tasks
+        # Dispatch parallel tasks — content travels in the message, no shared filesystem needed
         header = [
-            process_single_file_task.s(job_id, product_id, auto_map, logical_dataset_name, t)
-            for t in task_items
+            process_single_file_task.s(job_id, product_id, auto_map, logical_dataset_name, item)
+            for item in items
         ]
         callback = finalize_ingestion_job.s(job_id)
-        
+
         chord(header)(callback)
-        return {"status": "dispatched", "task_count": len(task_items)}
+        return {"status": "dispatched", "task_count": len(items)}
 
     except Exception as e:
         import traceback
@@ -97,20 +135,20 @@ def process_ingestion_job(self, job_id: str, product_id: str, auto_map: bool, lo
 
 @app.task
 def process_single_file_task(job_id: str, product_id: str, auto_map: bool, logical_dataset_name: str, task_item: dict):
-    """Worker task: processes one file."""
+    """Worker task: processes one file (or one sheet of a multi-sheet Excel)."""
+    import base64
     db: Session = SessionLocal()
     from .services.ingestion_service import process_single_ingestion_item, increment_job_progress
-    
+
     try:
         filename = task_item["filename"]
-        disk_path = task_item["disk_path"]
-        
-        with open(disk_path, "rb") as f:
-            content = f.read()
-            
+        content = base64.b64decode(task_item["content_b64"])
+        sheet_name = task_item.get("sheet_name")
+
         result = process_single_ingestion_item(
             db=db,
             filename=filename,
+            sheet_name=sheet_name,
             file_content=content,
             product_id=product_id,
             auto_map=auto_map,
@@ -136,12 +174,6 @@ def finalize_ingestion_job(results, job_id: str):
         job.status = "COMPLETED"
         job.results = sanitize_nans(results)
         db.commit()
-
-        # Clean up temp files
-        import shutil
-        temp_dir = os.path.join("storage", "temp_uploads", job_id)
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
 
         # Dispatch analytics pipeline for any logical datasets mapped during this job
         logical_ids_seen = set()

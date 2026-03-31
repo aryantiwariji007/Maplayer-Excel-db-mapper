@@ -153,6 +153,25 @@ export const ingestApi = {
   previewRemapped: (datasetId: string, mode: "full" | "mapped_only" = "full"): Promise<{ columns: string[]; rows: Record<string, unknown>[] }> =>
     api.get(`/ingest/datasets/${datasetId}/preview-remapped`, { params: { mode } }).then((r) => r.data),
 
+  bulkSaveCorrections: (
+    productId: string,
+    schemaName: string,
+    columnMapping?: Record<string, string>,
+    excludeDatasetId?: string
+  ): Promise<{
+    saved_datasets: number;
+    saved_corrections: number;
+    remapped_datasets: number;
+    schema_name: string;
+  }> => {
+    const form = new FormData();
+    form.append("product_id", productId);
+    form.append("schema_name", schemaName);
+    if (columnMapping) form.append("column_mapping", JSON.stringify(columnMapping));
+    if (excludeDatasetId) form.append("exclude_dataset_id", excludeDatasetId);
+    return api.post("/ingest/schema/bulk-corrections", form).then((r) => r.data);
+  },
+
   listSourceFiles: (logicalDatasetId: string): Promise<{
     dataset_id: string;
     file_name: string;
@@ -303,6 +322,12 @@ export const analyticsApi = {
 
   getFileInsight: (datasetId: string): Promise<DatasetFileInsightResponse | PendingResponse> =>
     api.get(`/analytics/datasets/${datasetId}/insight`).then((r) => r.data),
+
+  compareLogicalDataset: (
+    logicalDatasetId: string,
+    request: import("@/types").CompareRequest
+  ): Promise<import("@/types").CompareResponse> =>
+    api.post(`/analytics/logical-datasets/${logicalDatasetId}/compare`, request).then((r) => r.data),
 };
 
 export default api;
