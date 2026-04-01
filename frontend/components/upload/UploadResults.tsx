@@ -1,6 +1,6 @@
 "use client";
 import { useState } from "react";
-import { CheckCircle2, AlertCircle, ChevronDown, ChevronUp, Plus, Zap } from "lucide-react";
+import { CheckCircle2, AlertCircle, ChevronDown, ChevronUp, Plus, Zap, Unlink } from "lucide-react";
 import type { UploadResult } from "@/types";
 
 const PURPLE = "#a78bfa";
@@ -21,7 +21,7 @@ function SchemaBadge({ type }: { type?: string | null }) {
   return null;
 }
 
-function ResultRow({ r, onCreateSchema }: { r: UploadResult; onCreateSchema?: (r: UploadResult) => void }) {
+function ResultRow({ r, onCreateSchema, onUnmap }: { r: UploadResult; onCreateSchema?: (r: UploadResult) => void; onUnmap?: (r: UploadResult) => void }) {
   const [expanded, setExpanded] = useState(false);
   const isSuccess = r.status === "success";
   const name = r.file_name || r.filename || "File";
@@ -57,6 +57,15 @@ function ResultRow({ r, onCreateSchema }: { r: UploadResult; onCreateSchema?: (r
                 <span style={{ fontSize: 11, color: "hsl(220 10% 45%)" }}>
                   {Math.round(confidence * 100)}% match
                 </span>
+                {r.schema_type === "dynamic" && onUnmap && (
+                  <button
+                    onClick={() => onUnmap(r)}
+                    title="Unmap — remove this schema assignment so you can create a new one"
+                    style={{ background: "rgba(248,113,113,0.1)", border: "1px solid rgba(248,113,113,0.25)", color: "#f87171", fontSize: 10, padding: "2px 8px", borderRadius: 6, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 3 }}
+                  >
+                    <Unlink size={10} /> Unmap
+                  </button>
+                )}
               </>
             )}
             {isSuccess && !r.auto_mapped && (
@@ -106,10 +115,11 @@ function ResultRow({ r, onCreateSchema }: { r: UploadResult; onCreateSchema?: (r
 interface Props {
   results: UploadResult[];
   onCreateSchema?: (r: UploadResult) => void;
+  onUnmap?: (r: UploadResult) => void;
   isPending?: boolean;
 }
 
-export default function UploadResults({ results, onCreateSchema, isPending }: Props) {
+export default function UploadResults({ results, onCreateSchema, onUnmap, isPending }: Props) {
   if (results.length === 0) return null;
   const successCount = results.filter(r => r.status === "success").length;
   const errorCount = results.filter(r => r.status === "error").length;
@@ -145,6 +155,9 @@ export default function UploadResults({ results, onCreateSchema, isPending }: Pr
             r={r}
             onCreateSchema={
               r.status === "success" && !r.auto_mapped && !isPending ? onCreateSchema : undefined
+            }
+            onUnmap={
+              r.status === "success" && r.auto_mapped && r.schema_type === "dynamic" && !isPending ? onUnmap : undefined
             }
           />
         ))}

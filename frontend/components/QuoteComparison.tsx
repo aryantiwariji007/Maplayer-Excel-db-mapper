@@ -1,17 +1,18 @@
 "use client";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { analyticsApi, ingestApi } from "@/lib/api";
-import type { LogicalDataset, CompareRequest, CompareResponse, CompareRow } from "@/types";
+import type { LogicalDataset, TargetSchemaResponse, CompareRequest, CompareResponse, CompareRow } from "@/types";
 import {
   ArrowLeftRight, Play, Loader2, Download, Search,
-  ChevronDown, ChevronUp, Info, Star, Trophy
+  ChevronDown, ChevronUp, Info, Star, Trophy, Sparkles
 } from "lucide-react";
 
 const PURPLE = "#a78bfa";
 const BLUE = "#60a5fa";
 const GREEN = "#4ade80";
 const AMBER = "#fbbf24";
+const RED = "#f87171";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -133,10 +134,19 @@ function MultiSelect({
 interface Props {
   productId: string;
   logicalDatasets: LogicalDataset[];
+  schemas?: TargetSchemaResponse[];
 }
 
-export default function QuoteComparison({ productId, logicalDatasets }: Props) {
-  const [selectedLdId, setSelectedLdId] = useState<string>("");
+// Selection value format: "logical:{id}" | "static:{id}"
+function parseSelection(val: string): { type: "logical" | "static"; id: string } | null {
+  if (!val) return null;
+  const [type, id] = val.split(":");
+  if ((type === "logical" || type === "static") && id) return { type, id };
+  return null;
+}
+
+export default function QuoteComparison({ productId, logicalDatasets, schemas = [] }: Props) {
+  const [selection, setSelection] = useState<string>("");
   const [groupBy, setGroupBy] = useState<string[]>([]);
   const [pivotOn, setPivotOn] = useState<string>("source_file");
   const [valueColumns, setValueColumns] = useState<string[]>([]);
@@ -146,30 +156,153 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
   const [sortCol, setSortCol] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
-  // Fetch columns for selected logical dataset
+  // Feature 2: AI Configure
+  const [aiConfigLoading, setAiConfigLoading] = useState(false);
+  const [aiRationale, setAiRationale] = useState<string>("");
+
+  // Feature 3: AI Narrative
+  const [narrative, setNarrative] = useState<{ headline: string; bullets: string[]; recommendation: string } | null>(null);
+  const [narrativeLoading, setNarrativeLoading] = useState(false);
+
+  // Feature 1: Smart auto-detect — track whether user manually edited since last schema change
+  const userEditedRef = useRef(false);
+  const [autoDetectedCols, setAutoDetectedCols] = useState<string[]>([]);
+
+  const parsed = parseSelection(selection);
+
+  // For static TargetSchemas, derive columns directly from schema definition (no API call)
+  const staticSchema = useMemo(() => {
+    if (parsed?.type !== "static") return null;
+    return schemas.find((s) => String(s.id) === parsed.id) ?? null;
+  }, [parsed, schemas]);
+
+  // Fetch columns for logical datasets only
   const { data: previewData, isLoading: loadingCols } = useQuery({
-    queryKey: ["ld-preview-cols", selectedLdId],
-    queryFn: () => analyticsApi.previewLogicalDataset(selectedLdId),
-    enabled: !!selectedLdId,
+    queryKey: ["ld-preview-cols", parsed?.type === "logical" ? parsed.id : ""],
+    queryFn: () => analyticsApi.previewLogicalDataset(parsed!.id),
+    enabled: parsed?.type === "logical",
     staleTime: 60_000,
   });
 
   const allColumns = useMemo(() => {
+    if (staticSchema) {
+      // Use the schema's defined column keys — these are exactly what the user configured
+      return staticSchema.columns.map((c) => c.key).filter((c) => !INTERNAL_COLS.has(c));
+    }
     if (!previewData?.columns) return [];
-    return (previewData.columns as string[]).filter((c) => !INTERNAL_COLS.has(c));
-  }, [previewData]);
+    return (previewData.columns as string[]).filter(
+      (c) => !INTERNAL_COLS.has(c) && !/^unnamed_\d+$/i.test(c)
+    );
+  }, [staticSchema, previewData]);
+
+  // Feature 1: Smart column auto-detection when schema changes
+  useEffect(() => {
+    if (!selection || allColumns.length === 0) return;
+    // Only apply if user hasn't manually edited since last schema change
+    if (userEditedRef.current) return;
+
+    // groupBy heuristics
+    const groupByPatterns = [/^sr[_\s]?no$/i, /^ref[_\s]?no$/i, /_id$/i, /_no$/i, /^description$/i, /^name$/i, /^code$/i, /^item$/i, /^part$/i, /^type$/i, /^class$/i, /^category$/i];
+    const detectedGroupBy = allColumns
+      .filter((c) => groupByPatterns.some((p) => p.test(c)))
+      .slice(0, 3);
+
+    // valueColumns heuristics
+    const valuePatterns = [/price/i, /cost/i, /rate/i, /amount/i, /value/i, /qty/i, /quantity/i, /total/i];
+    const detectedValueCols = allColumns
+      .filter((c) => valuePatterns.some((p) => p.test(c)))
+      .slice(0, 2);
+
+    // aggregation heuristic
+    const numericPricePattern = /price|cost|rate|amount/i;
+    const detectedAggregation: CompareRequest["aggregation"] = detectedValueCols.some((c) => numericPricePattern.test(c))
+      ? "min"
+      : "first";
+
+    if (detectedGroupBy.length > 0) setGroupBy(detectedGroupBy);
+    if (detectedValueCols.length > 0) setValueColumns(detectedValueCols);
+    setAggregation(detectedAggregation);
+    setAutoDetectedCols(detectedGroupBy);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allColumns, selection]);
+
+  // selectedLdId kept for comparison API calls
+  const selectedLdId = parsed?.type === "logical" ? parsed.id : "";
+
+  const comparePayload: CompareRequest = {
+    group_by: groupBy,
+    pivot_on: pivotOn,
+    value_columns: valueColumns,
+    aggregation,
+    search: search || undefined,
+    limit: 5000,
+  };
 
   const compareMutation = useMutation({
-    mutationFn: () =>
-      analyticsApi.compareLogicalDataset(selectedLdId, {
-        group_by: groupBy,
-        pivot_on: pivotOn,
-        value_columns: valueColumns,
-        aggregation,
-        search: search || undefined,
-        limit: 5000,
-      }),
-    onSuccess: (data) => setResult(data),
+    mutationFn: () => {
+      setNarrative(null);
+      if (parsed?.type === "static") {
+        return analyticsApi.compareTargetSchema(parsed.id, comparePayload);
+      }
+      return analyticsApi.compareLogicalDataset(selectedLdId, comparePayload);
+    },
+    onSuccess: (data) => {
+      setResult(data);
+      // Feature 3: Kick off AI narrative asynchronously
+      if (data.rows.length > 0 && data.value_columns.length > 0) {
+        // Compute vendor_stats: {vendor: {col: {min, max, avg, count}}}
+        const vendorStats: Record<string, Record<string, { min: number | null; max: number | null; avg: number | null; count: number }>> = {};
+        for (const pv of data.pivot_values) {
+          vendorStats[pv] = {};
+          for (const vc of data.value_columns) {
+            const nums = data.rows
+              .map((r: CompareRow) => Number(r.values?.[pv]?.[vc]))
+              .filter((n: number) => !isNaN(n) && isFinite(n));
+            vendorStats[pv][vc] = {
+              min: nums.length > 0 ? Math.min(...nums) : null,
+              max: nums.length > 0 ? Math.max(...nums) : null,
+              avg: nums.length > 0 ? nums.reduce((a: number, b: number) => a + b, 0) / nums.length : null,
+              count: nums.length,
+            };
+          }
+        }
+        // best_vendor: {col: vendor_name}
+        const bestVendor: Record<string, string> = {};
+        for (const vc of data.value_columns) {
+          const b = data.rows[0]?.best?.[vc];
+          if (b) bestVendor[vc] = b;
+        }
+        // Use the first row's best as a proxy; aggregate for real best
+        for (const vc of data.value_columns) {
+          const wins: Record<string, number> = {};
+          data.rows.forEach((r: CompareRow) => { const b = r.best?.[vc]; if (b) wins[b] = (wins[b] || 0) + 1; });
+          const top = Object.entries(wins).sort((a, b) => b[1] - a[1])[0];
+          if (top) bestVendor[vc] = top[0];
+        }
+
+        const schemaName = parsed?.type === "static"
+          ? (schemas.find((s) => String(s.id) === parsed?.id)?.schema_name ?? "")
+          : (logicalDatasets.find((ld) => ld.id === parsed?.id)?.dataset_name ?? "");
+
+        setNarrativeLoading(true);
+        analyticsApi.compareNarrative({
+          schema_name: schemaName,
+          pivot_values: data.pivot_values,
+          value_columns: data.value_columns,
+          aggregation: data.aggregation,
+          vendor_stats: vendorStats,
+          best_vendor: bestVendor,
+          row_count: data.row_count,
+          coverage_stats: data.missing_coverage as Record<string, number>,
+        }).then((n) => {
+          setNarrative(n);
+        }).catch(() => {
+          // silently fail — narrative is non-critical
+        }).finally(() => {
+          setNarrativeLoading(false);
+        });
+      }
+    },
   });
 
   // Sort rows
@@ -195,7 +328,7 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
     }
   }
 
-  const canRun = !!selectedLdId && groupBy.length > 0 && !!pivotOn && valueColumns.length > 0;
+  const canRun = !!parsed && groupBy.length > 0 && !!pivotOn && valueColumns.length > 0;
 
   // Summary stats
   const summary = useMemo(() => {
@@ -221,7 +354,7 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20, maxWidth: 1200 }}>
       {/* Config Panel */}
-      <div className="card-glass">
+      <div className="card-glass" style={{ position: "sticky", top: 0, zIndex: 20 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
           <ArrowLeftRight size={16} color={PURPLE} />
           <h3 style={{ fontSize: 14, fontWeight: 600 }}>Comparison Configuration</h3>
@@ -240,13 +373,17 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
               Schema Group
             </label>
             <select
-              value={selectedLdId}
+              value={selection}
               onChange={(e) => {
-                setSelectedLdId(e.target.value);
+                setSelection(e.target.value);
                 setGroupBy([]);
                 setValueColumns([]);
                 setPivotOn("source_file");
                 setResult(null);
+                setNarrative(null);
+                setAiRationale("");
+                setAutoDetectedCols([]);
+                userEditedRef.current = false;
               }}
               style={{
                 background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)",
@@ -254,9 +391,20 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
               }}
             >
               <option value="">— Select dataset —</option>
-              {logicalDatasets.map((ld) => (
-                <option key={ld.id} value={ld.id}>{ld.dataset_name}</option>
-              ))}
+              {schemas.length > 0 && (
+                <optgroup label="Target Schemas">
+                  {schemas.map((s) => (
+                    <option key={`static:${s.id}`} value={`static:${s.id}`}>{s.schema_name}</option>
+                  ))}
+                </optgroup>
+              )}
+              {logicalDatasets.length > 0 && (
+                <optgroup label="Schema Groups">
+                  {logicalDatasets.map((ld) => (
+                    <option key={`logical:${ld.id}`} value={`logical:${ld.id}`}>{ld.dataset_name}</option>
+                  ))}
+                </optgroup>
+              )}
             </select>
           </div>
 
@@ -274,8 +422,13 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
                 label="Select key columns"
                 options={allColumns.filter((c) => c !== pivotOn && !valueColumns.includes(c))}
                 selected={groupBy}
-                onChange={setGroupBy}
+                onChange={(v) => { userEditedRef.current = true; setGroupBy(v); }}
               />
+            )}
+            {autoDetectedCols.length > 0 && !userEditedRef.current && (
+              <p style={{ fontSize: 11, color: "hsl(220 10% 45%)", fontStyle: "italic", marginTop: 3 }}>
+                Auto-detected: {autoDetectedCols.join(", ")}
+              </p>
             )}
           </div>
 
@@ -316,7 +469,7 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
               label="Select value columns"
               options={allColumns}
               selected={valueColumns}
-              onChange={setValueColumns}
+              onChange={(v) => { userEditedRef.current = true; setValueColumns(v); }}
               exclude={[...groupBy, pivotOn]}
             />
           </div>
@@ -341,6 +494,43 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
             </select>
           </div>
 
+          {/* AI Configure Button */}
+          <button
+            onClick={async () => {
+              if (!parsed || allColumns.length === 0) return;
+              const schemaName = parsed.type === "static"
+                ? (schemas.find((s) => String(s.id) === parsed.id)?.schema_name ?? "")
+                : (logicalDatasets.find((ld) => ld.id === parsed.id)?.dataset_name ?? "");
+              setAiConfigLoading(true);
+              setAiRationale("");
+              try {
+                const suggestion = await analyticsApi.suggestComparison(
+                  schemaName,
+                  allColumns.map((k) => ({ key: k }))
+                );
+                if (suggestion.group_by?.length) setGroupBy(suggestion.group_by);
+                if (suggestion.value_columns?.length) setValueColumns(suggestion.value_columns);
+                if (suggestion.aggregation) setAggregation(suggestion.aggregation as CompareRequest["aggregation"]);
+                if (suggestion.rationale) setAiRationale(suggestion.rationale);
+                userEditedRef.current = false;
+              } catch {
+                // silently ignore — AI is best-effort
+              } finally {
+                setAiConfigLoading(false);
+              }
+            }}
+            disabled={!parsed || allColumns.length === 0 || aiConfigLoading}
+            style={{
+              display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", alignSelf: "flex-end",
+              background: "rgba(167,139,250,0.12)", border: "1px solid rgba(167,139,250,0.35)",
+              borderRadius: 8, color: PURPLE, fontSize: 12, cursor: "pointer",
+              opacity: (!parsed || allColumns.length === 0) ? 0.5 : 1,
+            }}
+          >
+            {aiConfigLoading ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+            AI Configure
+          </button>
+
           {/* Run Button */}
           <button
             className="btn-gradient"
@@ -353,7 +543,15 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
           </button>
         </div>
 
-        {!selectedLdId && (
+        {/* AI Rationale hint */}
+        {aiRationale && (
+          <p style={{ fontSize: 11, color: PURPLE, fontStyle: "italic", marginTop: 10, display: "flex", alignItems: "flex-start", gap: 5 }}>
+            <Sparkles size={11} style={{ marginTop: 1, flexShrink: 0 }} />
+            {aiRationale}
+          </p>
+        )}
+
+        {!parsed && (
           <p style={{ fontSize: 12, color: "hsl(220 10% 45%)", marginTop: 12, display: "flex", alignItems: "center", gap: 6 }}>
             <Info size={12} />
             Select a schema group that has files from multiple vendors / sources mapped to it.
@@ -394,6 +592,40 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
                   </p>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* Feature 3: AI Narrative Card */}
+          {(narrativeLoading || narrative) && (
+            <div style={{
+              background: "rgba(167,139,250,0.08)", border: "1px solid rgba(167,139,250,0.25)",
+              borderRadius: 12, padding: "16px 20px",
+            }}>
+              {narrativeLoading && !narrative ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, color: PURPLE, fontSize: 13 }}>
+                  <Loader2 size={14} className="animate-spin" />
+                  Generating AI analysis…
+                </div>
+              ) : narrative && (
+                <>
+                  <p style={{ fontWeight: 700, color: PURPLE, fontSize: 14, marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
+                    <Sparkles size={14} />
+                    {narrative.headline}
+                  </p>
+                  <ul style={{ listStyle: "disc", paddingLeft: 20, marginBottom: 12 }}>
+                    {narrative.bullets.map((b, i) => (
+                      <li key={i} style={{ fontSize: 12, color: "hsl(220 20% 80%)", marginBottom: 4 }}>{b}</li>
+                    ))}
+                  </ul>
+                  <div style={{
+                    background: "rgba(96,165,250,0.1)", borderLeft: "3px solid #60a5fa",
+                    borderRadius: 4, padding: "10px 14px", fontSize: 12, color: "hsl(220 20% 85%)",
+                  }}>
+                    <span style={{ fontWeight: 600, color: BLUE }}>Recommendation: </span>
+                    {narrative.recommendation}
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -520,7 +752,33 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
                   )}
                 </thead>
                 <tbody>
-                  {sortedRows.map((row, ri) => (
+                  {sortedRows.map((row, ri) => {
+                    // Compute worst (highest numeric value) per value column across all pivot values
+                    const worstPv: Record<string, string | null> = {};
+                    for (const vc of result.value_columns) {
+                      let maxVal = -Infinity;
+                      let maxPv: string | null = null;
+                      for (const pv of result.pivot_values) {
+                        const v = Number(row.values?.[pv]?.[vc]);
+                        if (!isNaN(v) && v > maxVal) { maxVal = v; maxPv = pv; }
+                      }
+                      // Only mark as worst if there are at least 2 non-null values
+                      const nonNullCount = result.pivot_values.filter(
+                        (pv) => row.values?.[pv]?.[vc] != null
+                      ).length;
+                      worstPv[vc] = nonNullCount >= 2 ? maxPv : null;
+                    }
+
+                    // Feature 4: Compute per-row mean per value col for anomaly detection
+                    const rowMean: Record<string, number | null> = {};
+                    for (const vc of result.value_columns) {
+                      const nums = result.pivot_values
+                        .map((pv) => Number(row.values?.[pv]?.[vc]))
+                        .filter((n) => !isNaN(n) && isFinite(n));
+                      rowMean[vc] = nums.length >= 2 ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+                    }
+
+                    return (
                     <tr key={ri}>
                       {/* Key columns */}
                       {result.group_by.map((col) => (
@@ -533,20 +791,28 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
                         result.value_columns.map((vc, vci) => {
                           const val = row.values?.[pv]?.[vc];
                           const isBest = row.best?.[vc] === pv;
+                          const isWorst = !isBest && worstPv[vc] === pv;
+                          // Feature 4: anomaly detection
+                          const mean = rowMean[vc];
+                          const numVal = Number(val);
+                          const isAnomaly = !isBest && !isWorst && mean !== null && val != null
+                            && !isNaN(numVal) && isFinite(numVal)
+                            && Math.abs(numVal - mean) / mean > 0.20;
                           return (
                             <td
                               key={`${pv}-${vc}`}
                               style={{
                                 textAlign: "right",
                                 borderLeft: vci === 0 ? "1px solid hsl(220 15% 16%)" : undefined,
-                                color: val == null ? "hsl(220 10% 35%)" : isBest ? GREEN : "hsl(220 20% 88%)",
-                                background: isBest ? "rgba(74,222,128,0.06)" : undefined,
-                                fontWeight: isBest ? 700 : undefined,
+                                color: val == null ? "hsl(220 10% 35%)" : isBest ? GREEN : isWorst ? RED : isAnomaly ? AMBER : "hsl(220 20% 88%)",
+                                background: isBest ? "rgba(74,222,128,0.06)" : isWorst ? "rgba(248,113,113,0.06)" : isAnomaly ? "rgba(251,191,36,0.08)" : undefined,
+                                fontWeight: isBest || isWorst ? 700 : undefined,
                               }}
                             >
                               {val == null ? "—" : (
                                 <span style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4 }}>
                                   {isBest && <Star size={10} color={GREEN} />}
+                                  {isAnomaly && <span title="Value deviates >20% from row mean">⚠</span>}
                                   {fmtVal(val)}
                                 </span>
                               )}
@@ -573,7 +839,8 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
                         </td>
                       ))}
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
               <p style={{ fontSize: 11, color: "hsl(220 10% 45%)", padding: "8px 14px" }}>
@@ -581,6 +848,12 @@ export default function QuoteComparison({ productId, logicalDatasets }: Props) {
                 {search ? ` matching "${search}"` : ""}
                 {" "}· {result.pivot_values.length} {result.pivot_on === "source_file" ? "vendor(s)" : `${result.pivot_on} value(s)`}
                 {" "}· aggregation: {result.aggregation}
+                {" "}·{" "}
+                <span style={{ color: GREEN }}>★ best</span>
+                {" "}·{" "}
+                <span style={{ color: RED }}>✗ worst</span>
+                {" "}·{" "}
+                <span style={{ color: AMBER }}>⚠ &gt;20% deviation</span>
               </p>
             </div>
           )}

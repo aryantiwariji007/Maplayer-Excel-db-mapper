@@ -629,6 +629,45 @@ def delete_dataset(dataset_id: str, db: Session = Depends(get_db)):
     return {"status": "deleted", "table_name": table_name}
 
 
+@router.delete("/datasets/{dataset_id}/mapping")
+def unmap_dataset(dataset_id: str, db: Session = Depends(get_db)):
+    """Remove a dataset's mapping from its logical dataset without deleting the dataset itself.
+    Also clears the dataset's rows from the analytics table."""
+    mapping = db.execute(
+        select(LogicalDatasetMapping).where(LogicalDatasetMapping.dataset_id == dataset_id)
+    ).scalars().first()
+
+    if not mapping:
+        raise HTTPException(status_code=404, detail="No mapping found for this dataset")
+
+    ld = db.execute(
+        select(LogicalDataset).where(LogicalDataset.id == mapping.logical_dataset_id)
+    ).scalars().first()
+
+    # Remove this dataset's rows from the analytics table
+    if ld:
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(f'DELETE FROM "{ld.table_name}" WHERE dataset_id = :did'),
+                    {"did": dataset_id}
+                )
+        except Exception as e:
+            print(f"DEBUG: Could not remove rows from analytics table: {e}")
+
+    db.delete(mapping)
+
+    # Clear the stored column mapping and schema name on the dataset itself
+    dataset = db.execute(select(Dataset).where(Dataset.id == dataset_id)).scalars().first()
+    if dataset:
+        dataset.column_mapping = None
+        dataset.mapped_schema_name = None
+        db.add(dataset)
+
+    db.commit()
+    return {"status": "unmapped", "dataset_id": dataset_id}
+
+
 # ── Logical Dataset Management ────────────────────────────────────────────────
 
 class CreateLogicalDatasetRequest(BaseModel):
@@ -743,7 +782,8 @@ def list_all_schemas(product_id: str, db: Session = Depends(get_db)):
     dynamic_schemas = db.execute(select(LogicalDataset).where(LogicalDataset.product_id == product_id)).scalars().all()
     
     results = []
-    
+    static_schema_names = {s.schema_name for s in static_schemas}
+
     for s in static_schemas:
         results.append({
             "id": s.id,
@@ -752,8 +792,12 @@ def list_all_schemas(product_id: str, db: Session = Depends(get_db)):
             "description": s.description,
             "columns": [{"key": c.key, "data_type": c.data_type, "required": c.required, "description": c.description} for c in s.columns],
         })
-        
+
     for d in dynamic_schemas:
+        # Skip dynamic logical datasets that are just materializations of a static schema
+        # (they share the same name) — the static entry already represents them in the UI.
+        if d.dataset_name in static_schema_names:
+            continue
         # Get columns from mapping
         from ..services.similarity import get_logical_schema_columns
         cols = get_logical_schema_columns(db, d.id)

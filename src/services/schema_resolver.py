@@ -133,7 +133,15 @@ def resolve_best_schema(
             ai_match.analytics_table = ld.table_name
             return ai_match
 
+    # ── 3b. High-confidence Gemini shortcut ────────────────────────────────
+    # If Gemini returned any result above 0.70 but the schema id wasn't found
+    # in our loaded candidates (e.g. stale id), skip expensive fallback tiers
+    # to avoid wasting time on embed/qdrant calls for a near-certain miss.
+    if ai_match and ai_match.confidence >= 0.70:
+        return SchemaMatch(schema_type="none", reason=f"Gemini confident ({ai_match.confidence:.2f}) but schema not found locally — skipping fallback.")
+
     # ── 4. Fallback: score all candidates numerically ───────────────────────
+    # Only reached when Gemini returned None or confidence < 0.70.
     best_static = _score_static_schemas(source_columns, static_schemas, sample_data, db)
     best_dynamic = _score_dynamic_schemas(source_columns, logical_datasets, sample_data, db)
 
@@ -263,11 +271,11 @@ def _score_static_schemas(
         for c in schema.columns:
             target_aliases_flat.extend(c.aliases or [])
 
-        # Qdrant vector similarity (semantic)
-        qdrant_score = _qdrant_static_score(source_names, str(schema.id))
-
-        # Fuzzy name matching against keys + labels + aliases
+        # Fuzzy name matching first — used both for composite score and as Qdrant pre-filter
         fuzzy_score = _fuzzy_match_score(source_names, target_keys + target_labels + target_aliases_flat)
+
+        # Qdrant vector similarity — skipped when fuzzy score is too low (short-circuit)
+        qdrant_score = _qdrant_static_score(source_names, str(schema.id), fuzzy_pre_score=fuzzy_score)
 
         # Description/name embedding similarity
         sem_score = _semantic_bag_similarity(source_bag, f"{schema.schema_name} {schema.description}")
@@ -395,15 +403,24 @@ def _static_analytics_table(schema_id: str) -> str:
     return f"mapped_{str(schema_id).replace('-', '_')}"
 
 
-def _qdrant_static_score(source_cols: list[str], schema_id: str) -> float:
-    """Average best Qdrant vector similarity for source columns against a static schema."""
+def _qdrant_static_score(source_cols: list[str], schema_id: str, fuzzy_pre_score: float = 0.0) -> float:
+    """Average best Qdrant vector similarity for source columns against a static schema.
+
+    Short-circuits (returns 0) when the fuzzy pre-filter score is too low to
+    make this schema a viable candidate, avoiding unnecessary embed+Qdrant calls.
+    Embedding results are cached via lru_cache in embedding.py.
+    """
+    # Skip Qdrant entirely if fuzzy match is already very weak — the schema is unlikely to win
+    if fuzzy_pre_score < 0.25:
+        return 0.0
     try:
         from .embedding import generate_embedding
         from .qdrant_service import search_semantic_similarity
         scores = []
-        for col in source_cols[:10]:  # Limit to first 10 to avoid slow queries
+        # Limit to 5 columns (down from 10) — enough signal, half the Qdrant round-trips
+        for col in source_cols[:5]:
             text = col.replace("_", " ").replace("-", " ")
-            vec = generate_embedding(text)
+            vec = generate_embedding(text)  # cached — no re-embedding for same col
             results = search_semantic_similarity(vec, schema_id, limit=1)
             if results:
                 scores.append(results[0]["score"])

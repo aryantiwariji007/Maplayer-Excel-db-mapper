@@ -3,7 +3,7 @@ import { useState } from "react";
 import dynamic from "next/dynamic";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { analyticsApi, ingestApi } from "@/lib/api";
+import { analyticsApi, ingestApi, schemasApi } from "@/lib/api";
 import { useAppStore } from "@/store/useAppStore";
 import Header from "@/components/layout/Header";
 import type { MetricDefinition, DiscoveredMetric, QueryResult } from "@/types";
@@ -117,6 +117,12 @@ export default function AnalyticsPage() {
   const { data: logicalDatasets } = useQuery({
     queryKey: ["logical-datasets", productId],
     queryFn: () => ingestApi.listLogicalDatasets(productId),
+    enabled: !!productId,
+  });
+
+  const { data: targetSchemas } = useQuery({
+    queryKey: ["schemas", productId],
+    queryFn: () => schemasApi.list(productId),
     enabled: !!productId,
   });
 
@@ -590,6 +596,7 @@ export default function AnalyticsPage() {
           <QuoteComparison
             productId={productId}
             logicalDatasets={logicalDatasets ?? []}
+            schemas={targetSchemas ?? []}
           />
         )}
       </div>

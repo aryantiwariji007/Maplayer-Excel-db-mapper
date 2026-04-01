@@ -204,6 +204,21 @@ export default function UploadPage() {
     onError: () => toast.error("Failed to delete dynamic schema"),
   });
 
+  const unmapMutation = useMutation({
+    mutationFn: (datasetId: string) => ingestApi.unmapDataset(datasetId),
+    onSuccess: (_, datasetId) => {
+      toast.success("Schema unmapped — you can now create a new schema for this file.");
+      setResults(prev => prev.map(r =>
+        r.dataset_id === datasetId
+          ? { ...r, auto_mapped: false, schema_type: null, mapped_to: undefined, match_confidence: undefined, column_mapping: undefined }
+          : r
+      ));
+      qc.invalidateQueries({ queryKey: ["datasets", productId] });
+      qc.invalidateQueries({ queryKey: ["logical-datasets", productId] });
+    },
+    onError: () => toast.error("Failed to unmap schema"),
+  });
+
   return (
     <>
       <Header title="Upload" subtitle="Ingest CSV and Excel files into MapLayer" />
@@ -295,8 +310,9 @@ export default function UploadPage() {
             {results.length > 0 && (
               <UploadResults
                 results={results}
-                isPending={createDynamicSchemaMutation.isPending}
+                isPending={createDynamicSchemaMutation.isPending || unmapMutation.isPending}
                 onCreateSchema={(r) => openSchemaModal(r.dataset_id!, r.file_name || r.filename || "Dataset")}
+                onUnmap={(r) => r.dataset_id && unmapMutation.mutate(r.dataset_id)}
               />
             )}
 

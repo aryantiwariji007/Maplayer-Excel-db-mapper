@@ -208,6 +208,97 @@ Respond ONLY with valid JSON:
         return {"narrative": "", "bullet_points": []}
 
 
+def suggest_comparison_config_with_ai(schema_name: str, columns: list) -> dict:
+    """
+    Given schema name and column definitions, suggest GROUP BY keys, VALUE columns, and aggregation.
+    columns: [{"key": "price", "data_type": "numeric"}, ...]
+    Returns: {"group_by": [...], "value_columns": [...], "aggregation": "min"|"max"|"avg"|"first", "rationale": "..."}
+    """
+    if not GEMINI_API_KEY:
+        return {}
+
+    try:
+        model = genai.GenerativeModel('gemini-3-flash-preview')
+
+        prompt = f"""
+You are an expert data analyst. Given the schema name and column definitions below, suggest the best configuration for a vendor comparison pivot table.
+
+Schema Name: {schema_name}
+
+Columns (with types where available):
+{json.dumps(columns, indent=2)}
+
+Your task:
+1. Choose 1-3 columns that best serve as GROUP BY keys (row identifiers that uniquely identify a line item, e.g. description, ref_no, item code).
+2. Choose 1-2 columns that are numeric values to compare across vendors (e.g. price, rate, cost, quantity).
+3. Choose the best aggregation: "min" if comparing prices/costs (lower is better), "max" if comparing performance metrics (higher is better), "avg" for averages, "first" for text/categorical.
+4. Explain your reasoning briefly.
+
+Respond ONLY with valid JSON:
+{{
+    "group_by": ["description", "ref_no"],
+    "value_columns": ["price", "currency"],
+    "aggregation": "min",
+    "rationale": "price is numeric so minimum finds cheapest vendor; description+ref_no uniquely identify line items"
+}}
+"""
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        result = json.loads(response.text)
+        return result
+    except Exception as e:
+        print(f"Gemini suggest_comparison_config_with_ai Error: {e}")
+        return {}
+
+
+def generate_comparison_narrative_with_ai(schema_name: str, comparison_summary: dict) -> dict:
+    """
+    Generate an AI narrative from comparison stats (NO raw data, just aggregated summaries).
+    comparison_summary contains: vendor_count, value_columns, vendor_stats (min/max/avg per vendor per col),
+    best_vendor per col, coverage_stats.
+    Returns: {"headline": "...", "bullets": ["...", "...", "..."], "recommendation": "..."}
+    """
+    if not GEMINI_API_KEY:
+        return {}
+
+    try:
+        model = genai.GenerativeModel('gemini-3-flash-preview')
+
+        prompt = f"""
+You are a senior procurement analyst generating an executive summary from pre-computed vendor comparison statistics.
+You are analyzing COMPUTED STATISTICS ONLY — no raw customer data.
+
+Schema / Dataset: {schema_name}
+
+Comparison Summary:
+{json.dumps(comparison_summary, indent=2, cls=DateTimeEncoder)}
+
+Instructions:
+1. Write a 1-line headline summarizing the overall comparison finding.
+2. Write exactly 3 bullet points covering key findings (reference actual numbers from vendor_stats).
+3. Write a clear recommendation: which vendor to choose and why.
+4. Be specific — mention vendor names, price differences, coverage gaps where relevant.
+
+Respond ONLY with valid JSON:
+{{
+    "headline": "1-line summary",
+    "bullets": ["Finding 1...", "Finding 2...", "Finding 3..."],
+    "recommendation": "Which vendor to choose and why"
+}}
+"""
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        result = json.loads(response.text)
+        return result
+    except Exception as e:
+        print(f"Gemini generate_comparison_narrative_with_ai Error: {e}")
+        return {}
+
+
 def discover_metrics_with_ai(dataset_name, columns, sample_data):
     """
     Suggest business metrics based on a dataset's columns and sample data.

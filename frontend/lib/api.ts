@@ -116,6 +116,9 @@ export const ingestApi = {
   deleteDataset: (datasetId: string): Promise<{ message: string }> =>
     api.delete(`/ingest/datasets/${datasetId}`).then((r) => r.data),
 
+  unmapDataset: (datasetId: string): Promise<{ status: string; dataset_id: string }> =>
+    api.delete(`/ingest/datasets/${datasetId}/mapping`).then((r) => r.data),
+
   createLogicalDataset: (data: LogicalDatasetCreate): Promise<LogicalDataset> =>
     api.post("/ingest/logical-datasets", data).then((r) => r.data),
 
@@ -137,14 +140,21 @@ export const ingestApi = {
     logicalDatasetId?: string,
     autoMap?: boolean,
     columnMapping?: Record<string, string>
-  ): Promise<{ message: string }> => {
+  ): Promise<{
+    message?: string;
+    detected_schema?: string;
+    logical_dataset_id?: string;
+    target_to_source_map?: Record<string, string>;
+    mappings_used?: number;
+  }> => {
     const form = new FormData();
     form.append("dataset_id", datasetId);
     if (logicalDatasetId) form.append("logical_dataset_id", logicalDatasetId);
     if (autoMap !== undefined) form.append("auto_map", String(autoMap));
     if (columnMapping)
       form.append("column_mapping", JSON.stringify(columnMapping));
-    return api.post("/ingest/dataset/map", form).then((r) => r.data);
+    // AI mapping can take >60s on complex files — use 3-minute timeout
+    return api.post("/ingest/dataset/map", form, { timeout: 180000 }).then((r) => r.data);
   },
 
   mappingHistory: (datasetId: string): Promise<MappingHistoryRecord[]> =>
@@ -328,6 +338,30 @@ export const analyticsApi = {
     request: import("@/types").CompareRequest
   ): Promise<import("@/types").CompareResponse> =>
     api.post(`/analytics/logical-datasets/${logicalDatasetId}/compare`, request).then((r) => r.data),
+
+  compareTargetSchema: (
+    schemaId: string | number,
+    request: import("@/types").CompareRequest
+  ): Promise<import("@/types").CompareResponse> =>
+    api.post(`/analytics/target-schemas/${schemaId}/compare`, request).then((r) => r.data),
+
+  suggestComparison: (
+    schemaName: string,
+    columns: { key: string; data_type?: string }[]
+  ): Promise<{ group_by: string[]; value_columns: string[]; aggregation: string; rationale: string }> =>
+    api.post("/analytics/suggest-comparison", { schema_name: schemaName, columns }).then((r) => r.data),
+
+  compareNarrative: (data: {
+    schema_name: string;
+    pivot_values: string[];
+    value_columns: string[];
+    aggregation: string;
+    vendor_stats: Record<string, Record<string, { min: number | null; max: number | null; avg: number | null; count: number }>>;
+    best_vendor: Record<string, string>;
+    row_count: number;
+    coverage_stats: Record<string, number>;
+  }): Promise<{ headline: string; bullets: string[]; recommendation: string }> =>
+    api.post("/analytics/compare-narrative", data).then((r) => r.data),
 };
 
 export default api;

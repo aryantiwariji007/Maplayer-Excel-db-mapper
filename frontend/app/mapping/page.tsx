@@ -33,6 +33,7 @@ export default function MappingPage() {
   const selectedSchema = schemas?.find(s => String(s.id) === String(selectedSchemaId)) || null;
 
   const [detectedSchema, setDetectedSchema] = useState<string | null>(null);
+  const [detectedTargetKeys, setDetectedTargetKeys] = useState<string[]>([]);
   const [showNewSchema, setShowNewSchema] = useState(false);
   const [newSchemaName, setNewSchemaName] = useState("");
   const [newSchemaColumns, setNewSchemaColumns] = useState([{ key: "", data_type: "text", description: "" }]);
@@ -47,30 +48,43 @@ export default function MappingPage() {
       );
     },
     onSuccess: (data: any) => {
+      let autoSelectedSchemaId: string | null = null;
+
       if (data.detected_schema) {
         setDetectedSchema(data.detected_schema);
         toast.success(`Auto-mapped to: ${data.detected_schema}`);
+        // Auto-select the detected schema so Save Corrections works without manual click
+        const matchedSchema = schemas?.find(
+          (s) => s.schema_name.toLowerCase() === data.detected_schema.toLowerCase()
+        );
+        if (matchedSchema) autoSelectedSchemaId = String(matchedSchema.id);
       } else {
         toast.success(data.message || "Auto-mapping applied");
       }
       if (data.target_to_source_map) {
-        // Reverse it to source -> target for the UI
+        // target_to_source_map = { target_col: source_col } — reverse to source -> target
         const newMap = {} as ColumnMapping;
         Object.entries(data.target_to_source_map).forEach(([tgt, src]) => {
           newMap[src as string] = tgt;
         });
-        setMappingDraft({ columnMappings: newMap });
 
-        // Auto-select the schema so target keys appear immediately
-        if (data.logical_dataset_id && data.detected_schema) {
-          const tempSchema = {
-            id: data.logical_dataset_id,
-            schema_name: data.detected_schema,
-            schema_type: "dynamic" as const,
-            columns: Object.keys(data.target_to_source_map).map(k => ({ key: k, data_type: "text" }))
-          } as TargetSchemaResponse;
-          setMappingDraft({ selectedSchemaId: String(tempSchema.id) });
-        }
+        // Store the target keys immediately so dropdowns have options without waiting
+        // for the schemas query to refetch. Keys of target_to_source_map ARE the target columns.
+        const tgtKeys = Object.keys(data.target_to_source_map);
+        setDetectedTargetKeys(tgtKeys);
+
+        // Set columnMappings + auto-selected schema in one call to avoid partial renders.
+        // Prefer logical_dataset_id from response, fall back to name-matched schema.
+        // Prefer name-matched schema (guaranteed to exist in the list) over the raw
+        // logical_dataset_id UUID, which may be deduplicated away in /all-schemas.
+        const schemaId = autoSelectedSchemaId || (data.logical_dataset_id ? String(data.logical_dataset_id) : null);
+        setMappingDraft({
+          columnMappings: newMap,
+          ...(schemaId ? { selectedSchemaId: schemaId } : {}),
+        });
+      } else if (autoSelectedSchemaId) {
+        // No column map returned but schema was detected — still select it
+        setMappingDraft({ selectedSchemaId: autoSelectedSchemaId });
       }
       qc.invalidateQueries({ queryKey: ["datasets", productId] });
       qc.invalidateQueries({ queryKey: ["schemas", productId] });
@@ -166,8 +180,12 @@ export default function MappingPage() {
     },
   });
 
-  const sourceColumns = selectedDataset?.columns ?? [];
-  const targetKeys = selectedSchema?.columns.map((c) => c.key) ?? [];
+  const sourceColumns: string[] = (selectedDataset?.columns ?? []).map((c) =>
+    typeof c === "string" ? c : (c.normalized_name || c.column_name)
+  );
+  // Use selectedSchema's columns when available; fall back to detectedTargetKeys populated
+  // immediately by onSuccess so dropdowns render without waiting for schemas to refetch.
+  const targetKeys = selectedSchema?.columns.map((c) => c.key) ?? detectedTargetKeys;
 
   return (
     <>
@@ -188,7 +206,7 @@ export default function MappingPage() {
                   {datasets.map((ds, i) => (
                     <button
                       key={ds.id || i}
-                      onClick={() => { setMappingDraft({ selectedDatasetId: ds.id, columnMappings: {} }); }}
+                      onClick={() => { setMappingDraft({ selectedDatasetId: ds.id, columnMappings: {} }); setDetectedTargetKeys([]); setDetectedSchema(null); }}
                       style={{
                         textAlign: "left", padding: "10px 12px", borderRadius: 9, cursor: "pointer",
                         border: "1px solid",

@@ -494,7 +494,7 @@ export default function PreviewPage() {
                 )}
                 {viewMode.type === "source-file" && (
                   <span style={{ fontSize: 12, padding: "2px 10px", borderRadius: 999, background: "rgba(96,165,250,0.12)", border: "1px solid rgba(96,165,250,0.3)", color: "#93c5fd", display: "flex", alignItems: "center", gap: 5 }}>
-                    <Sparkles size={10} /> Schema-Mapped · {(viewMode as any).fileName}
+                    <Sparkles size={10} /> Schema-Mapped · {logicalDatasets?.find(ld => ld.id === (viewMode as any).logicalId)?.dataset_name ?? (viewMode as any).fileName}
                   </span>
                 )}
               </div>
@@ -569,7 +569,7 @@ export default function PreviewPage() {
             ) : previewData && previewData.columns && previewData.columns.length > 0 ? (
               <PreviewTable
                 data={previewData as any}
-                label={viewMode.type === "source-file" ? (viewMode as any).fileName : undefined}
+                label={viewMode.type === "source-file" ? (logicalDatasets?.find(ld => ld.id === (viewMode as any).logicalId)?.dataset_name ?? (viewMode as any).fileName) : undefined}
               />
             ) : previewData ? (
               <div style={{ textAlign: "center", padding: "60px 20px", color: "hsl(220 10% 40%)" }}>

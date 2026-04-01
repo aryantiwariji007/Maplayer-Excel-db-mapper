@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 
 from ..database import get_db, engine
-from ..models import Dataset, LogicalDataset, LogicalDatasetMapping, DatasetColumn, Metric, DatasetProfile, DataAnomaly, TrendAnalysis, DatasetInsight, DatasetFileProfile, DatasetFileAnomaly, DatasetFileInsight
+from ..models import Dataset, LogicalDataset, LogicalDatasetMapping, DatasetColumn, Metric, DatasetProfile, DataAnomaly, TrendAnalysis, DatasetInsight, DatasetFileProfile, DatasetFileAnomaly, DatasetFileInsight, TargetSchema
 from ..services.dataset_store import query_dataset, get_table_columns
 from ..services.gemini import discover_metrics_with_ai
 from ..utils.json_utils import sanitize_nans
@@ -621,31 +621,13 @@ class CompareRequest(BaseModel):
     limit: int = 5000
 
 
-@router.post("/logical-datasets/{logical_dataset_id}/compare")
-def compare_logical_dataset(
-    logical_dataset_id: str,
-    req: CompareRequest,
-    db: Session = Depends(get_db),
-):
-    """
-    Return a pivot/comparison table from a logical dataset.
-
-    Groups rows by `group_by` columns, pivots on `pivot_on` dimension,
-    aggregates `value_columns` per cell. Works for any multi-source comparison
-    (vendor quotes, regional sales, lab results, etc.).
-    """
+def _execute_compare(table_name: str, req: CompareRequest):
+    """Shared pivot/comparison logic used by both logical-dataset and target-schema compare endpoints."""
     from collections import defaultdict, OrderedDict
 
-    ld = db.execute(
-        select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)
-    ).scalars().first()
-    if not ld:
-        raise HTTPException(status_code=404, detail="Logical dataset not found")
-
-    # Fetch rows — include source_file via join so users can pivot on it
     sql = f"""
         SELECT d.file_name AS source_file, t.*
-        FROM "{ld.table_name}" t
+        FROM "{table_name}" t
         LEFT JOIN datasets d ON t.dataset_id = d.id
         LIMIT {min(req.limit, 10000)}
     """
@@ -778,3 +760,69 @@ def compare_logical_dataset(
         "row_count": len(result_rows),
         "missing_coverage": missing_coverage,
     })
+
+
+@router.post("/logical-datasets/{logical_dataset_id}/compare")
+def compare_logical_dataset(
+    logical_dataset_id: str,
+    req: CompareRequest,
+    db: Session = Depends(get_db),
+):
+    ld = db.execute(
+        select(LogicalDataset).where(LogicalDataset.id == logical_dataset_id)
+    ).scalars().first()
+    if not ld:
+        raise HTTPException(status_code=404, detail="Logical dataset not found")
+    return _execute_compare(ld.table_name, req)
+
+
+@router.post("/target-schemas/{schema_id}/compare")
+def compare_target_schema(
+    schema_id: str,
+    req: CompareRequest,
+    db: Session = Depends(get_db),
+):
+    schema = db.execute(
+        select(TargetSchema).where(TargetSchema.id == schema_id)
+    ).scalars().first()
+    if not schema:
+        raise HTTPException(status_code=404, detail="Target schema not found")
+    table_name = f"mapped_{str(schema.id).replace('-', '_')}"
+    return _execute_compare(table_name, req)
+
+
+# ── AI-Powered Comparison Assistance ─────────────────────────────────────────
+
+class SuggestCompareRequest(BaseModel):
+    columns: list  # [{"key": "price", "data_type": "text"}, ...]
+    schema_name: str
+
+
+@router.post("/suggest-comparison")
+def suggest_comparison_config(req: SuggestCompareRequest):
+    from ..services.gemini import suggest_comparison_config_with_ai
+    result = suggest_comparison_config_with_ai(req.schema_name, req.columns)
+    if not result:
+        raise HTTPException(status_code=503, detail="AI suggestion unavailable")
+    return result
+
+
+class CompareNarrativeRequest(BaseModel):
+    schema_name: str
+    pivot_values: list[str]      # vendor names
+    value_columns: list[str]
+    aggregation: str
+    vendor_stats: dict           # {vendor: {col: {min, max, avg, count}}}
+    best_vendor: dict            # {col: vendor_name}
+    row_count: int
+    coverage_stats: dict         # {vendor: missing_count}
+
+
+@router.post("/compare-narrative")
+def compare_narrative(req: CompareNarrativeRequest):
+    from ..services.gemini import generate_comparison_narrative_with_ai
+    summary = req.model_dump()
+    result = generate_comparison_narrative_with_ai(req.schema_name, summary)
+    if not result:
+        raise HTTPException(status_code=503, detail="AI narrative unavailable")
+    return result
