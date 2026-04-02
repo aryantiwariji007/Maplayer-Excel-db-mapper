@@ -444,7 +444,7 @@ export default function QuoteComparison({ productId, logicalDatasets, schemas = 
                 setGroupBy(groupBy.filter((c) => c !== e.target.value));
                 setValueColumns(valueColumns.filter((c) => c !== e.target.value));
               }}
-              disabled={!selectedLdId}
+              disabled={!parsed}
               style={{
                 background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)",
                 borderRadius: 8, padding: "7px 10px", color: "hsl(220 20% 90%)", fontSize: 12, outline: "none",
@@ -452,6 +452,7 @@ export default function QuoteComparison({ productId, logicalDatasets, schemas = 
               }}
             >
               <option value="source_file">Source File (Vendor)</option>
+              <option value="__columns__">Columns (Side-by-side)</option>
               {allColumns
                 .filter((c) => !groupBy.includes(c) && !valueColumns.includes(c))
                 .map((c) => (
@@ -463,14 +464,14 @@ export default function QuoteComparison({ productId, logicalDatasets, schemas = 
           {/* Value Columns */}
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
             <label style={{ fontSize: 11, fontWeight: 600, color: "hsl(220 10% 55%)", textTransform: "uppercase", letterSpacing: "0.4px" }}>
-              Values to Compare
+              {pivotOn === "__columns__" ? "Vendor Columns" : "Values to Compare"}
             </label>
             <MultiSelect
-              label="Select value columns"
+              label={pivotOn === "__columns__" ? "Select vendor columns" : "Select value columns"}
               options={allColumns}
               selected={valueColumns}
               onChange={(v) => { userEditedRef.current = true; setValueColumns(v); }}
-              exclude={[...groupBy, pivotOn]}
+              exclude={pivotOn === "__columns__" ? groupBy : [...groupBy, pivotOn]}
             />
           </div>
 
@@ -846,7 +847,7 @@ export default function QuoteComparison({ productId, logicalDatasets, schemas = 
               <p style={{ fontSize: 11, color: "hsl(220 10% 45%)", padding: "8px 14px" }}>
                 {result.row_count} item{result.row_count !== 1 ? "s" : ""}
                 {search ? ` matching "${search}"` : ""}
-                {" "}· {result.pivot_values.length} {result.pivot_on === "source_file" ? "vendor(s)" : `${result.pivot_on} value(s)`}
+                {" "}· {result.pivot_values.length} {result.pivot_on === "source_file" ? "vendor(s)" : result.pivot_on === "__columns__" ? "column(s)" : `${result.pivot_on} value(s)`}
                 {" "}· aggregation: {result.aggregation}
                 {" "}·{" "}
                 <span style={{ color: GREEN }}>★ best</span>

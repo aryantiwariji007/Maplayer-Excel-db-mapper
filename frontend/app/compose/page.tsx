@@ -205,9 +205,20 @@ export default function ComposePage() {
                       style={{ width: "100%", marginBottom: 6, padding: "6px 10px", borderRadius: 7, border: "1px solid hsl(220 15% 22%)", background: "hsl(220 15% 10%)", color: "inherit", fontSize: 12 }}
                     >
                       <option value="">— Select dataset —</option>
-                      {(availableSchemas ?? []).filter(s => s.schema_type === "dynamic").map((schema) => (
-                        <option key={schema.id} value={schema.id}>{schema.schema_name}</option>
-                      ))}
+                      {(availableSchemas ?? []).filter(s => s.schema_type === "static").length > 0 && (
+                        <optgroup label="Target Schemas">
+                          {(availableSchemas ?? []).filter(s => s.schema_type === "static").map((schema) => (
+                            <option key={schema.id} value={schema.id}>{schema.schema_name}</option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {(availableSchemas ?? []).filter(s => s.schema_type === "dynamic").length > 0 && (
+                        <optgroup label="Schema Groups">
+                          {(availableSchemas ?? []).filter(s => s.schema_type === "dynamic").map((schema) => (
+                            <option key={schema.id} value={schema.id}>{schema.schema_name}</option>
+                          ))}
+                        </optgroup>
+                      )}
                     </select>
                     <div style={{ display: "flex", gap: 6 }}>
                       <select
@@ -216,7 +227,7 @@ export default function ComposePage() {
                         style={{ flex: 1, padding: "6px 10px", borderRadius: 7, border: "1px solid hsl(220 15% 22%)", background: "hsl(220 15% 10%)", color: "inherit", fontSize: 12, outline: "none", cursor: "pointer" }}
                       >
                         <option value="">— Select join key —</option>
-                        {(availableSchemas ?? []).filter(s => s.schema_type === "dynamic").find(s => String(s.id) === String(src.dataset_id))?.columns.map((c, ci) => (
+                        {(availableSchemas ?? []).find(s => String(s.id) === String(src.dataset_id))?.columns.map((c, ci) => (
                           <option key={`${c.key}-${ci}`} value={c.key}>{c.key}</option>
                         ))}
                       </select>

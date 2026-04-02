@@ -275,17 +275,18 @@ Schema / Dataset: {schema_name}
 Comparison Summary:
 {json.dumps(comparison_summary, indent=2, cls=DateTimeEncoder)}
 
-Instructions:
-1. Write a 1-line headline summarizing the overall comparison finding.
-2. Write exactly 3 bullet points covering key findings (reference actual numbers from vendor_stats).
-3. Write a clear recommendation: which vendor to choose and why.
-4. Be specific — mention vendor names, price differences, coverage gaps where relevant.
+CRITICAL RULES — follow exactly:
+1. The `best_vendor` field is the system's pre-computed winner per value column, determined by row-by-row minimum/maximum comparison across all items. Your recommendation MUST name this vendor as the best choice. Do NOT contradict it by recalculating from averages — a vendor with fewer data points (see coverage_stats) will have a misleadingly low average.
+2. If coverage_stats shows a vendor is missing many rows, note this as a data gap, not as evidence of cheaper pricing.
+3. Write a 1-line headline consistent with the `best_vendor` result.
+4. Write exactly 3 bullet points referencing actual numbers from vendor_stats and noting large coverage gaps.
+5. The recommendation must name the vendor from `best_vendor` and explain it won the most row-by-row comparisons.
 
 Respond ONLY with valid JSON:
 {{
-    "headline": "1-line summary",
+    "headline": "1-line summary consistent with best_vendor",
     "bullets": ["Finding 1...", "Finding 2...", "Finding 3..."],
-    "recommendation": "Which vendor to choose and why"
+    "recommendation": "Vendor from best_vendor and why it won row-by-row"
 }}
 """
         response = model.generate_content(

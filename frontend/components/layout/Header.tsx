@@ -1,7 +1,7 @@
 "use client";
 import { useAppStore } from "@/store/useAppStore";
 import { useState } from "react";
-import { Bell, ChevronDown, Settings, Package, Plus } from "lucide-react";
+import { ChevronDown, Package, Plus } from "lucide-react";
 
 const PRODUCTS = ["default", "crm-prod", "ecommerce-v2", "analytics-core"];
 
@@ -137,23 +137,6 @@ export default function Header({ title, subtitle }: HeaderProps) {
           )}
         </div>
 
-        {/* Bell icon */}
-        <button style={{
-          background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)",
-          borderRadius: 8, padding: "6px 10px", cursor: "pointer", color: "hsl(220 10% 55%)",
-          display: "flex", alignItems: "center",
-        }}>
-          <Bell size={15} />
-        </button>
-
-        {/* Settings icon */}
-        <button style={{
-          background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)",
-          borderRadius: 8, padding: "6px 10px", cursor: "pointer", color: "hsl(220 10% 55%)",
-          display: "flex", alignItems: "center",
-        }}>
-          <Settings size={15} />
-        </button>
       </div>
     </div>
   );

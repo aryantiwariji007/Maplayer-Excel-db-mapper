@@ -125,7 +125,26 @@ def perform_mapping(req: MapDatasetRequest, db: Session):
                     conn.execute(text(f'DELETE FROM "{old_ld.table_name}" WHERE dataset_id = :did'), {"did": req.dataset_id})
             except Exception as e:
                 print(f"DEBUG: Failed to delete old mapped rows: {e}")
-                
+
+        # Also clean up static schema table if this dataset was previously auto-mapped to one
+        if dataset.schema_type == "static" and dataset.mapped_schema_name:
+            static_schema = db.execute(
+                select(TargetSchema).where(
+                    TargetSchema.product_id == dataset.product_id,
+                    TargetSchema.schema_name == dataset.mapped_schema_name,
+                )
+            ).scalars().first()
+            if static_schema:
+                static_table = f"mapped_{str(static_schema.id).replace('-', '_')}"
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f'DELETE FROM "{static_table}" WHERE dataset_id = :did'),
+                            {"did": req.dataset_id}
+                        )
+                except Exception as e:
+                    print(f"DEBUG: Failed to delete old static-mapped rows from {static_table}: {e}")
+
         existing_mapping.logical_dataset_id = req.logical_dataset_id
         existing_mapping.column_mapping = req.column_mapping
         existing_mapping.version = (existing_mapping.version or 1) + 1

@@ -625,8 +625,102 @@ def _execute_compare(table_name: str, req: CompareRequest):
     """Shared pivot/comparison logic used by both logical-dataset and target-schema compare endpoints."""
     from collections import defaultdict, OrderedDict
 
+    # ── Column-based comparison mode ──────────────────────────────────────────
+    # When pivot_on == "__columns__", each selected value_column IS a vendor dimension.
+    # No JOIN needed; column names become the pivot values.
+    if req.pivot_on == "__columns__" and req.value_columns:
+        col_sql = f'SELECT * FROM "{table_name}" LIMIT {min(req.limit, 10000)}'
+        try:
+            col_result = query_dataset(engine, col_sql)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to query dataset: {str(e)}")
+
+        col_rows = col_result.get("rows", [])
+        if not col_rows:
+            return sanitize_nans({
+                "group_by": req.group_by, "pivot_on": req.pivot_on,
+                "pivot_values": list(req.value_columns), "value_columns": ["value"],
+                "aggregation": req.aggregation, "rows": [], "row_count": 0, "missing_coverage": {},
+            })
+
+        if req.search:
+            s = req.search.lower()
+            col_rows = [
+                row for row in col_rows
+                if any(s in str(row.get(col, "") or "").lower() for col in req.group_by)
+            ]
+
+        pivot_values = list(req.value_columns)
+        col_key_to_pivot: "OrderedDict[tuple, dict]" = OrderedDict()
+        col_key_to_dict: "dict[tuple, dict]" = {}
+
+        for row in col_rows:
+            key_tuple = tuple(str(row.get(col, "") or "") for col in req.group_by)
+            if key_tuple not in col_key_to_pivot:
+                col_key_to_pivot[key_tuple] = defaultdict(lambda: defaultdict(list))
+                col_key_to_dict[key_tuple] = {col: str(row.get(col, "") or "") for col in req.group_by}
+            for vc in pivot_values:
+                val = row.get(vc)
+                if val is not None and str(val).strip() not in ("", "None", "null"):
+                    col_key_to_pivot[key_tuple][vc]["value"].append(val)
+
+        def _agg_col(vals: list, agg: str):
+            if not vals:
+                return None
+            numeric = []
+            for v in vals:
+                try:
+                    numeric.append(float(v))
+                except (ValueError, TypeError):
+                    pass
+            if agg == "first":
+                return vals[0]
+            if numeric:
+                if agg == "min": return min(numeric)
+                if agg == "max": return max(numeric)
+                if agg == "avg": return round(sum(numeric) / len(numeric), 4)
+            return vals[0]
+
+        col_result_rows = []
+        for key_tuple, pivot_dict in col_key_to_pivot.items():
+            values: "dict[str, dict]" = {}
+            for pv in pivot_values:
+                vc_map = pivot_dict.get(pv, {})
+                values[pv] = {"value": _agg_col(list(vc_map.get("value", [])), req.aggregation)}
+
+            best: "dict[str, str]" = {}
+            entries = []
+            for pv in pivot_values:
+                v = values[pv]["value"]
+                if v is not None and str(v).strip() not in ("", "None"):
+                    try:
+                        fval = float(v)
+                        if not __import__("math").isnan(fval):
+                            entries.append((pv, fval))
+                    except (ValueError, TypeError):
+                        pass
+            if len(entries) > 1:
+                winner = max(entries, key=lambda x: x[1]) if req.aggregation == "max" else min(entries, key=lambda x: x[1])
+                best["value"] = winner[0]
+
+            col_result_rows.append({"key": col_key_to_dict[key_tuple], "values": values, "best": best})
+
+        col_missing: "dict[str, int]" = {}
+        for pv in pivot_values:
+            missing = sum(1 for row in col_result_rows if row["values"].get(pv, {}).get("value") is None)
+            if missing:
+                col_missing[pv] = missing
+
+        return sanitize_nans({
+            "group_by": req.group_by, "pivot_on": req.pivot_on,
+            "pivot_values": pivot_values, "value_columns": ["value"],
+            "aggregation": req.aggregation, "rows": col_result_rows,
+            "row_count": len(col_result_rows), "missing_coverage": col_missing,
+        })
+    # ── end __columns__ mode ──────────────────────────────────────────────────
+
     sql = f"""
-        SELECT d.file_name AS source_file, t.*
+        SELECT COALESCE(d.file_name, t.dataset_id::text) AS source_file, t.*
         FROM "{table_name}" t
         LEFT JOIN datasets d ON t.dataset_id = d.id
         LIMIT {min(req.limit, 10000)}

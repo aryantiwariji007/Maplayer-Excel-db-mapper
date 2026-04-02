@@ -99,11 +99,12 @@ def create_composite_view(req: CompositeViewCreateRequest, db: Session = Depends
             # Fallback: static TargetSchema
             ts = db.execute(select(TargetSchema).where(TargetSchema.id == src.dataset_id)).scalars().first()
             if ts:
+                static_table = f"mapped_{str(ts.id).replace('-', '_')}"
                 sources_out.append({
                     "dataset_type": "static",
                     "dataset_id": src.dataset_id,
                     "dataset_name": ts.schema_name,
-                    "table_name": ts.schema_name,
+                    "table_name": static_table,
                     "join_key": src.join_key.strip().lower(),
                     "alias": src.alias.strip(),
                 })

@@ -90,15 +90,16 @@ def append_rows(engine: Engine, analytics_table: str, source_table: str, column_
     target_str = ", " + ", ".join(target_cols)
     expr_str = ", " + ", ".join(source_exprs)
 
-    sql = f"""
+    delete_sql = f'DELETE FROM "{analytics_table}" WHERE dataset_id = :did'
+    insert_sql = f"""
     INSERT INTO "{analytics_table}" (dataset_id{target_str})
     SELECT '{dataset_id}'{expr_str}
     FROM "{source_table}";
     """
     try:
-        with engine.connect() as conn:
-            conn.execute(text(sql))
-            conn.commit()
+        with engine.begin() as conn:
+            conn.execute(text(delete_sql), {"did": dataset_id})
+            conn.execute(text(insert_sql))
         print(f"DEBUG: Materialized {source_table} -> {analytics_table} ({len(target_cols)} columns)")
     except Exception as e:
         print(f"ERROR: Materialization failed {source_table} -> {analytics_table}: {e}")
