@@ -206,8 +206,8 @@ export default function AnalyticsPage() {
         {/* Tab bar */}
         <div style={{ display: "flex", gap: 4, marginBottom: 20, background: "hsl(220 15% 10%)", borderRadius: 10, padding: 4, width: "fit-content" }}>
           {([
-            { key: "query", label: "SQL Query" },
-            { key: "metrics", label: "Metrics & AI" },
+            { key: "query", label: "SQL Query", icon: null },
+            { key: "metrics", label: "Metrics & AI", icon: null },
             { key: "compare", label: "Compare", icon: <ArrowLeftRight size={12} style={{ display: "inline", marginRight: 5 }} /> },
           ] as const).map((t) => (
             <button
