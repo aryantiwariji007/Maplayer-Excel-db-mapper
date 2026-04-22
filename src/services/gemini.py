@@ -343,3 +343,54 @@ def discover_metrics_with_ai(dataset_name, columns, sample_data):
     print(f"Gemini Discovery Response: {response.text}")
     return json.loads(response.text)
 
+
+def extract_pdf_table_with_ai(
+    page_image_b64: str,
+    schema_columns: list[dict],
+    hint: str | None = None,
+) -> list[dict]:
+    """Extract structured table data from a PDF page image and map it to a static schema.
+
+    Returns a list of row dicts keyed by the schema column keys.
+    Returns [] if extraction fails or no matching data is found.
+    """
+    if not GEMINI_API_KEY:
+        print("Gemini API key missing, skipping PDF extraction.")
+        return []
+
+    try:
+        model = genai.GenerativeModel(
+            "gemini-3-flash-preview",
+            generation_config={"response_mime_type": "application/json"},
+        )
+
+        schema_desc = json.dumps(schema_columns, indent=2)
+        hint_line = f"\nExtraction Hint: {hint}" if hint else ""
+
+        prompt = f"""You are a document data extraction assistant. Extract structured data from the PDF page image provided.
+
+Target Schema — extract data into EXACTLY these keys:
+{schema_desc}
+{hint_line}
+
+Instructions:
+1. Locate the table or structured data on the page that best matches the schema columns.
+2. Extract ALL rows visible. Do not truncate or summarize.
+3. Each row must be a JSON object whose keys are EXACTLY the schema key names above.
+4. Use null for cells that are empty, illegible, or have no corresponding value.
+5. For numeric fields (integer/float data_type), strip units and return the number only (e.g. "3.5 kg" → 3.5, "DN1800" → 1800).
+6. If no matching table or structured data is found, return an empty array [].
+7. If multiple tables exist, extract from the one whose columns best match the schema.
+
+Respond ONLY with a valid JSON array of row objects — no explanation, no markdown, just the array."""
+
+        image_part = {"inline_data": {"mime_type": "image/png", "data": page_image_b64}}
+        response = model.generate_content([image_part, prompt])
+        result = json.loads(response.text)
+        if isinstance(result, list):
+            return result
+        return []
+    except Exception as e:
+        print(f"PDF extraction AI error: {e}")
+        return []
+

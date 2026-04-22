@@ -25,6 +25,8 @@ import type {
   DatasetFileProfileResponse,
   DatasetFileAnomalyResponse,
   DatasetFileInsightResponse,
+  PdfPreviewResponse,
+  PdfExtractResponse,
 } from "@/types";
 
 const api = axios.create({
@@ -362,6 +364,34 @@ export const analyticsApi = {
     coverage_stats: Record<string, number>;
   }): Promise<{ headline: string; bullets: string[]; recommendation: string }> =>
     api.post("/analytics/compare-narrative", data).then((r) => r.data),
+};
+
+// =============================
+// PDF EXTRACTION — /pdf
+// =============================
+export const pdfApi = {
+  previewPage: (file: File, pageNum: number): Promise<PdfPreviewResponse> => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("page_num", String(pageNum));
+    return api.post("/pdf/preview", form, { timeout: 30000 }).then((r) => r.data);
+  },
+
+  extractData: (
+    file: File,
+    pageNum: number,
+    schemaId: string,
+    productId: string,
+    hint?: string
+  ): Promise<PdfExtractResponse> => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("page_num", String(pageNum));
+    form.append("schema_id", schemaId);
+    form.append("product_id", productId);
+    if (hint) form.append("hint", hint);
+    return api.post("/pdf/extract", form, { timeout: 120000 }).then((r) => r.data);
+  },
 };
 
 export default api;

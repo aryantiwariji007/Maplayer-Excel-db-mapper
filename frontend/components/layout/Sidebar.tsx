@@ -9,10 +9,12 @@ import {
   Layers,
   Zap,
   Link2,
+  FileText,
 } from "lucide-react";
 
 const navItems = [
   { href: "/upload", label: "Upload", icon: Upload, desc: "Ingest files" },
+  { href: "/pdf-extract", label: "PDF Extract", icon: FileText, desc: "Extract from PDF" },
   { href: "/mapping", label: "Mapping", icon: GitBranch, desc: "Map columns" },
   { href: "/preview", label: "Preview", icon: Eye, desc: "Inspect data" },
   { href: "/analytics", label: "Analytics", icon: BarChart3, desc: "Query & metrics" },

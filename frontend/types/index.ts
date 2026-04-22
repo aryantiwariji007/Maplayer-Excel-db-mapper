@@ -326,3 +326,19 @@ export interface CompareResponse {
   row_count: number;
   missing_coverage: Record<string, number>;
 }
+
+// ---- PDF Extraction ----
+export interface PdfPreviewResponse {
+  page_image_b64: string;
+  page_count: number;
+  page_num: number;
+}
+
+export interface PdfExtractResponse {
+  dataset_id: string;
+  table_name: string;
+  row_count: number;
+  columns: { name: string; type: string }[];
+  preview_rows: Record<string, unknown>[];
+  schema_name: string;
+}

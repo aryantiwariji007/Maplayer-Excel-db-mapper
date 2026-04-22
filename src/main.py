@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.database import init_db
 from src.services.qdrant_service import init_qdrant
-from src.routers import schemas, map_endpoint, ingest, analytics, composite_views
+from src.routers import schemas, map_endpoint, ingest, analytics, composite_views, pdf_extract
 import uvicorn
 from dotenv import load_dotenv
 import os
@@ -56,6 +56,7 @@ app.include_router(map_endpoint.router, prefix="/map", tags=["Mapping"])
 app.include_router(ingest.router, prefix="/ingest", tags=["Ingest"])
 app.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
 app.include_router(composite_views.router, prefix="/composite", tags=["Composite Views"])
+app.include_router(pdf_extract.router, prefix="/pdf", tags=["PDF Extraction"])
 
 if __name__ == "__main__":
     uvicorn.run("src.main:app", host="0.0.0.0", port=8001, reload=True)
