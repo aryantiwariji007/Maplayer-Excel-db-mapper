@@ -1,13 +1,14 @@
 """
 pdf_extract.py
 ─────────────────────────────────────────────
-Endpoints for PDF page preview and AI-powered data extraction
-mapped to a static TargetSchema.
+Endpoints for PDF page preview, table analysis, and AI-powered data extraction.
 
   POST /pdf/preview  → render a page thumbnail (base64 PNG)
+  POST /pdf/analyze  → detect table columns + suggest best static schema
   POST /pdf/extract  → extract table data and persist as a Dataset
 """
 
+import json
 import uuid
 from typing import Optional
 
@@ -18,8 +19,9 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db, engine
 from ..models import Dataset, DatasetColumn, DatasetVersion, TargetSchema
+from ..schemas import DynamicColumnDef, PdfAnalyzeResponse
 from ..services.dataset_store import create_dataset_table, insert_dataset_rows
-from ..services.gemini import extract_pdf_table_with_ai
+from ..services.gemini import analyze_pdf_table, extract_pdf_table_with_ai
 from ..services.pdf_extractor import get_page_count, render_page_to_base64
 from ..services.schema_inference import pg_type
 
@@ -61,30 +63,67 @@ async def pdf_page_preview(
     return {"page_image_b64": thumbnail_b64, "page_count": page_count, "page_num": page_num}
 
 
+@router.post("/analyze", response_model=PdfAnalyzeResponse)
+async def pdf_analyze(
+    file: UploadFile = File(...),
+    page_num: int = Form(...),
+    product_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Detect table columns on a PDF page and find the best matching static schema."""
+    content = await file.read()
+    try:
+        page_count = get_page_count(content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+
+    if page_num < 1 or page_num > page_count:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Page {page_num} is out of range. This PDF has {page_count} page(s).",
+        )
+
+    page_image_b64 = render_page_to_base64(content, page_num, dpi=150)
+
+    # Build compact schema descriptors for the AI prompt
+    all_schemas = db.execute(
+        select(TargetSchema).where(TargetSchema.product_id == product_id)
+    ).scalars().all()
+
+    existing_schemas = [
+        {
+            "id": s.id,
+            "name": s.schema_name,
+            "columns": [
+                {"key": col.key, "label": col.label, "data_type": col.data_type}
+                for col in s.columns
+            ],
+        }
+        for s in all_schemas
+    ]
+
+    result = analyze_pdf_table(page_image_b64, existing_schemas)
+    return PdfAnalyzeResponse(**result)
+
+
 @router.post("/extract")
 async def pdf_extract(
     file: UploadFile = File(...),
     page_num: int = Form(...),
-    schema_id: str = Form(...),
     product_id: str = Form(...),
+    schema_id: Optional[str] = Form(None),
+    dynamic_columns_json: Optional[str] = Form(None),
     hint: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     """Extract table data from a PDF page and persist it as a Dataset.
 
-    Uses Gemini vision to map extracted rows to the chosen TargetSchema.
+    Accepts either schema_id (static schema) or dynamic_columns_json (inline column list).
     """
-    # ── Load schema ───────────────────────────────────────────────────────────
-    schema = db.execute(
-        select(TargetSchema).where(TargetSchema.id == schema_id)
-    ).scalars().first()
-    if not schema:
-        raise HTTPException(status_code=404, detail=f"Schema '{schema_id}' not found.")
-
-    if not schema.columns:
-        raise HTTPException(
-            status_code=400, detail="The selected schema has no columns defined."
-        )
+    if not schema_id and not dynamic_columns_json:
+        raise HTTPException(status_code=400, detail="Provide either schema_id or dynamic_columns_json.")
+    if schema_id and dynamic_columns_json:
+        raise HTTPException(status_code=400, detail="Provide only one of schema_id or dynamic_columns_json.")
 
     # ── Render page ───────────────────────────────────────────────────────────
     content = await file.read()
@@ -101,19 +140,76 @@ async def pdf_extract(
 
     page_image_b64 = render_page_to_base64(content, page_num, dpi=150)
 
-    # ── Build schema column descriptors for the prompt ────────────────────────
-    schema_columns = [
-        {
-            "key": col.key,
-            "label": col.label,
-            "data_type": col.data_type,
-            "description": col.description or "",
-            "required": col.required,
-            "format_hint": col.format_hint or "",
-            "examples": col.examples or [],
-        }
-        for col in schema.columns
-    ]
+    # ── Static schema path ────────────────────────────────────────────────────
+    if schema_id:
+        schema = db.execute(
+            select(TargetSchema).where(TargetSchema.id == schema_id)
+        ).scalars().first()
+        if not schema:
+            raise HTTPException(status_code=404, detail=f"Schema '{schema_id}' not found.")
+        if not schema.columns:
+            raise HTTPException(status_code=400, detail="The selected schema has no columns defined.")
+
+        schema_columns = [
+            {
+                "key": col.key,
+                "label": col.label,
+                "data_type": col.data_type,
+                "description": col.description or "",
+                "required": col.required,
+                "format_hint": col.format_hint or "",
+                "examples": col.examples or [],
+            }
+            for col in schema.columns
+        ]
+        schema_type_value = "static"
+        mapped_schema_name = schema.schema_name
+        column_mapping = {col.key: col.key for col in schema.columns}
+        columns_meta = [
+            {
+                "column_name": col.key,
+                "normalized_name": col.key,
+                "data_type": _DTYPE_ALIAS.get(col.data_type.lower(), "string"),
+                "pg_type": pg_type(_DTYPE_ALIAS.get(col.data_type.lower(), "string")),
+            }
+            for col in schema.columns
+        ]
+
+    # ── Dynamic schema path ───────────────────────────────────────────────────
+    else:
+        try:
+            raw = json.loads(dynamic_columns_json)  # type: ignore[arg-type]
+            dynamic_cols = [DynamicColumnDef(**c) for c in raw]
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid dynamic_columns_json: {e}")
+
+        if not dynamic_cols:
+            raise HTTPException(status_code=400, detail="dynamic_columns_json must contain at least one column.")
+
+        schema_columns = [
+            {
+                "key": col.key,
+                "label": col.label,
+                "data_type": col.data_type,
+                "description": col.description or "",
+                "required": False,
+                "format_hint": col.format_hint or "",
+                "examples": [],
+            }
+            for col in dynamic_cols
+        ]
+        schema_type_value = "dynamic"
+        mapped_schema_name = f"Custom ({len(dynamic_cols)} columns)"
+        column_mapping = {col.key: col.key for col in dynamic_cols}
+        columns_meta = [
+            {
+                "column_name": col.key,
+                "normalized_name": col.key,
+                "data_type": _DTYPE_ALIAS.get(col.data_type.lower(), "string"),
+                "pg_type": pg_type(_DTYPE_ALIAS.get(col.data_type.lower(), "string")),
+            }
+            for col in dynamic_cols
+        ]
 
     # ── Call Gemini ───────────────────────────────────────────────────────────
     rows = extract_pdf_table_with_ai(page_image_b64, schema_columns, hint)
@@ -126,24 +222,8 @@ async def pdf_extract(
             ),
         )
 
-    # ── Build columns_meta from TargetColumn definitions ─────────────────────
-    # Use schema keys directly as both column_name and normalized_name —
-    # Gemini was instructed to use the exact schema key names.
-    columns_meta = []
-    for col in schema.columns:
-        dtype = _DTYPE_ALIAS.get(col.data_type.lower(), "string")
-        columns_meta.append(
-            {
-                "column_name": col.key,
-                "normalized_name": col.key,
-                "data_type": dtype,
-                "pg_type": pg_type(dtype),
-            }
-        )
-
     # ── Convert to DataFrame ──────────────────────────────────────────────────
     df = pd.DataFrame(rows)
-    # Ensure all schema columns exist in the DataFrame (fill missing with None)
     for col in columns_meta:
         if col["normalized_name"] not in df.columns:
             df[col["normalized_name"]] = None
@@ -159,16 +239,14 @@ async def pdf_extract(
     safe_filename = (file.filename or "document.pdf").replace("/", "_")
     display_name = f"PDF: {safe_filename} (p{page_num})"
 
-    column_mapping = {col.key: col.key for col in schema.columns}
-
     dataset = Dataset(
         id=dataset_id,
         product_id=product_id,
         file_name=display_name,
         table_name=table_name,
         row_count=row_count,
-        schema_type="static",
-        mapped_schema_name=schema.schema_name,
+        schema_type=schema_type_value,
+        mapped_schema_name=mapped_schema_name,
         column_mapping=column_mapping,
     )
     db.add(dataset)
@@ -196,5 +274,6 @@ async def pdf_extract(
         "row_count": row_count,
         "columns": columns_out,
         "preview_rows": preview_rows,
-        "schema_name": schema.schema_name,
+        "schema_name": mapped_schema_name,
+        "schema_mode": schema_type_value,
     }

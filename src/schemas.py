@@ -59,3 +59,29 @@ class CorrectionRecordResponse(CorrectionRequest):
 
     class Config:
         from_attributes = True
+
+
+# ── Dynamic / Analyze Schema Models ──────────────────────────────────────────
+
+class DynamicColumnDef(BaseModel):
+    key: str
+    label: str
+    data_type: str = "string"
+    description: Optional[str] = None
+    format_hint: Optional[str] = None
+
+class DetectedColumn(BaseModel):
+    detected_header: str
+    suggested_key: str
+    data_type: str = "string"
+
+class SchemaMatchSuggestion(BaseModel):
+    schema_id: str
+    schema_name: str
+    confidence: float
+    reason: str
+
+class PdfAnalyzeResponse(BaseModel):
+    detected_columns: List[DetectedColumn]
+    best_match: Optional[SchemaMatchSuggestion] = None
+    confidence_threshold: float = 0.7

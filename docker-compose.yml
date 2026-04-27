@@ -1,111 +1,112 @@
 version: '3.8'
 
 services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: maplayer-qdrant
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - ./qdrant_storage:/qdrant/storage:z
-    restart: always
+    qdrant:
+        image: qdrant/qdrant:latest
+        container_name: maplayer-qdrant
+        ports:
+            - "6333:6333"
+            - "6334:6334"
+        volumes:
+            - ./qdrant_storage:/qdrant/storage:z
+        restart: always
 
-  postgres:
-    image: postgres:15
-    container_name: maplayer-postgres
-    environment:
-      POSTGRES_USER: maplayer
-      POSTGRES_PASSWORD: maplayer_password
-      POSTGRES_DB: maplayer_db
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    restart: always
+    postgres:
+        image: postgres:15
+        container_name: maplayer-postgres
+        environment:
+            POSTGRES_USER: maplayer
+            POSTGRES_PASSWORD: maplayer_password
+            POSTGRES_DB: maplayer_db
+        ports:
+            - "5432:5432"
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        restart: always
 
-  redis:
-    image: redis:7-alpine
-    container_name: maplayer-redis
-    ports:
-      - "6379:6379"
-    restart: always
+    redis:
+        image: redis:7-alpine
+        container_name: maplayer-redis
+        ports:
+            - "6379:6379"
+        restart: always
 
-  api:
-    build:
-      context: .
-      dockerfile: backend.Dockerfile
-    container_name: maplayer-api
-    depends_on:
-      - postgres
-      - qdrant
-      - redis
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      - POSTGRES_HOST=postgres
-      - QDRANT_HOST=qdrant
-      - REDIS_URL=redis://redis:6379/0
-    volumes:
-      - .:/app
-    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
-    restart: always
+    api:
+        build:
+            context: .
+            dockerfile: backend.Dockerfile
+        container_name: maplayer-api
+        depends_on:
+            - postgres
+            - qdrant
+            - redis
+        ports:
+            - "8000:8000"
+        env_file:
+            - .env
+        environment:
+            - POSTGRES_HOST=postgres
+            - QDRANT_HOST=qdrant
+            - REDIS_URL=redis://redis:6379/0
+        volumes:
+            - .:/app
+        command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+        restart: always
 
-  celery_worker:
-    build:
-      context: .
-      dockerfile: backend.Dockerfile
-    container_name: maplayer-worker
-    # Use watchgod for hot-reloading Celery worker (needs to be in requirements.txt)
-    command: watchfiles 'celery -A src.celery_app worker --loglevel=info --concurrency=10' .
-    depends_on:
-      - postgres
-      - qdrant
-      - redis
-    env_file:
-      - .env
-    environment:
-      - POSTGRES_HOST=postgres
-      - QDRANT_HOST=qdrant
-      - REDIS_URL=redis://redis:6379/0
-    volumes:
-      - .:/app
-    restart: always
+    celery_worker:
+        build:
+            context: .
+            dockerfile: backend.Dockerfile
+        container_name: maplayer-worker
+        # Use watchgod for hot-reloading Celery worker (needs to be in requirements.txt)
+        command: watchfiles 'celery -A src.celery_app worker --loglevel=info --concurrency=10' .
+        depends_on:
+            - postgres
+            - qdrant
+            - redis
+        env_file:
+            - .env
+        environment:
+            - POSTGRES_HOST=postgres
+            - QDRANT_HOST=qdrant
+            - REDIS_URL=redis://redis:6379/0
+        volumes:
+            - .:/app
+        restart: always
 
-  flower:
-    image: mher/flower
-    container_name: maplayer-flower
-    ports:
-      - "5555:5555"
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-    depends_on:
-      - redis
-    restart: always
+    flower:
+        image: mher/flower
+        container_name: maplayer-flower
+        ports:
+            - "5555:5555"
+        environment:
+            - CELERY_BROKER_URL=redis://redis:6379/0
+        depends_on:
+            - redis
+        restart: always
 
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: maplayer-frontend
-    ports:
-      - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
-      - CHOKIDAR_USEPOLLING=true
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-      - /app/.next
-    depends_on:
-      - api
-    restart: always
+    frontend:
+        build:
+            context: ./frontend
+            dockerfile: Dockerfile
+        container_name: maplayer-frontend
+        ports:
+            - "3000:3000"
+        environment:
+            - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+            - CHOKIDAR_USEPOLLING=true
+        volumes:
+            - ./frontend:/app
+            - /app/node_modules
+            - /app/.next
+        depends_on:
+            - api
+        restart: always
 
 volumes:
-  postgres_data:
+    postgres_data:
+
 
 networks:
-  default:
-    name: maplayer-network
+    default:
+        name: maplayer-network

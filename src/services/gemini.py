@@ -394,3 +394,88 @@ Respond ONLY with a valid JSON array of row objects — no explanation, no markd
         print(f"PDF extraction AI error: {e}")
         return []
 
+
+CONFIDENCE_THRESHOLD = 0.7
+
+
+def analyze_pdf_table(
+    page_image_b64: str,
+    existing_schemas: list[dict],
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+) -> dict:
+    """Detect table columns on a PDF page and suggest the best matching static schema.
+
+    Returns a dict with:
+      detected_columns: list of {detected_header, suggested_key, data_type}
+      best_match: {schema_id, schema_name, confidence, reason} or None
+      confidence_threshold: the threshold used
+    """
+    empty = {"detected_columns": [], "best_match": None, "confidence_threshold": confidence_threshold}
+
+    if not GEMINI_API_KEY:
+        print("Gemini API key missing, skipping PDF table analysis.")
+        return empty
+
+    try:
+        model = genai.GenerativeModel(
+            "gemini-3-flash-preview",
+            generation_config={"response_mime_type": "application/json"},
+        )
+
+        schemas_desc = json.dumps(existing_schemas, indent=2) if existing_schemas else "[]"
+
+        prompt = f"""You are a document analysis assistant. Analyze the PDF page image provided.
+
+Perform TWO tasks and return a single JSON object:
+
+TASK 1 — Column Detection:
+Examine the primary table on the page. List every visible column header.
+For each column produce:
+  - "detected_header": exact text of the header as seen in the table
+  - "suggested_key": snake_case version (lowercase, spaces/special chars → underscore)
+  - "data_type": one of string | integer | float | boolean | timestamp
+
+TASK 2 — Schema Matching:
+Compare the detected headers against these existing schemas:
+{schemas_desc}
+
+Find the best matching schema. For a good match, the schema's column keys/labels should
+substantially overlap with the detected headers. Score 0.0 to 1.0.
+Return the best match only if confidence >= {confidence_threshold}, otherwise null.
+
+Respond ONLY with this JSON structure (no markdown, no explanation):
+{{
+  "detected_columns": [
+    {{"detected_header": "Item No.", "suggested_key": "item_no", "data_type": "string"}}
+  ],
+  "best_match": {{
+    "schema_id": "<id from schemas list>",
+    "schema_name": "<name>",
+    "confidence": 0.85,
+    "reason": "8 of 10 detected columns match schema keys"
+  }}
+}}
+
+If no table is found on the page, return detected_columns as [].
+If no schema matches well enough, return best_match as null."""
+
+        image_part = {"inline_data": {"mime_type": "image/png", "data": page_image_b64}}
+        response = model.generate_content([image_part, prompt])
+        result = json.loads(response.text)
+
+        if not isinstance(result, dict):
+            return empty
+
+        result.setdefault("detected_columns", [])
+        result.setdefault("best_match", None)
+        result["confidence_threshold"] = confidence_threshold
+
+        # Enforce threshold on best_match
+        if result["best_match"] and result["best_match"].get("confidence", 0) < confidence_threshold:
+            result["best_match"] = None
+
+        return result
+    except Exception as e:
+        print(f"PDF analysis AI error: {e}")
+        return empty
+

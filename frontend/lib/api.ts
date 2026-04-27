@@ -27,6 +27,8 @@ import type {
   DatasetFileInsightResponse,
   PdfPreviewResponse,
   PdfExtractResponse,
+  PdfAnalyzeResponse,
+  DynamicColumnDef,
 } from "@/types";
 
 const api = axios.create({
@@ -377,19 +379,32 @@ export const pdfApi = {
     return api.post("/pdf/preview", form, { timeout: 30000 }).then((r) => r.data);
   },
 
+  analyzeTable: (
+    file: File,
+    pageNum: number,
+    productId: string
+  ): Promise<PdfAnalyzeResponse> => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("page_num", String(pageNum));
+    form.append("product_id", productId);
+    return api.post("/pdf/analyze", form, { timeout: 90000 }).then((r) => r.data);
+  },
+
   extractData: (
     file: File,
     pageNum: number,
-    schemaId: string,
     productId: string,
-    hint?: string
+    options: { schemaId?: string; dynamicColumns?: DynamicColumnDef[]; hint?: string }
   ): Promise<PdfExtractResponse> => {
     const form = new FormData();
     form.append("file", file);
     form.append("page_num", String(pageNum));
-    form.append("schema_id", schemaId);
     form.append("product_id", productId);
-    if (hint) form.append("hint", hint);
+    if (options.schemaId) form.append("schema_id", options.schemaId);
+    if (options.dynamicColumns)
+      form.append("dynamic_columns_json", JSON.stringify(options.dynamicColumns));
+    if (options.hint) form.append("hint", options.hint);
     return api.post("/pdf/extract", form, { timeout: 120000 }).then((r) => r.data);
   },
 };

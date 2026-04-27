@@ -13,15 +13,45 @@ import {
   BarChart3,
   Upload,
   BookOpen,
+  Search,
+  Trash2,
+  Plus,
+  Save,
 } from "lucide-react";
 import { pdfApi, schemasApi } from "@/lib/api";
-import type { PdfExtractResponse, PdfPreviewResponse, TargetSchemaResponse } from "@/types";
+import type {
+  PdfExtractResponse,
+  PdfPreviewResponse,
+  PdfAnalyzeResponse,
+  TargetSchemaResponse,
+  DynamicColumnDef,
+  DetectedColumn,
+} from "@/types";
 import { useAppStore } from "@/store/useAppStore";
 import Header from "@/components/layout/Header";
 
 const PURPLE = "#a78bfa";
 const BLUE = "#60a5fa";
 const GREEN = "#4ade80";
+const ORANGE = "#fb923c";
+
+type SchemaMode = "static" | "dynamic";
+
+interface EditableColumn extends DetectedColumn {
+  key: string;
+  label: string;
+  data_type: string;
+  selected: boolean;
+}
+
+const DATA_TYPES = ["string", "integer", "float", "boolean", "timestamp"];
+
+function toSnakeCase(str: string): string {
+  return str
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
 
 export default function PdfExtractPage() {
   const { productId } = useAppStore();
@@ -35,9 +65,18 @@ export default function PdfExtractPage() {
   const [extractResult, setExtractResult] = useState<PdfExtractResponse | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
 
+  // Schema mode
+  const [schemaMode, setSchemaMode] = useState<SchemaMode>("static");
+  const [analyzeResult, setAnalyzeResult] = useState<PdfAnalyzeResponse | null>(null);
+  const [editableColumns, setEditableColumns] = useState<EditableColumn[]>([]);
+
+  // Save schema after dynamic extraction
+  const [wantsSaveSchema, setWantsSaveSchema] = useState(false);
+  const [saveSchemaName, setSaveSchemaName] = useState("");
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const { data: schemas } = useQuery<TargetSchemaResponse[]>({
+  const { data: schemas, refetch: refetchSchemas } = useQuery<TargetSchemaResponse[]>({
     queryKey: ["schemas", productId],
     queryFn: () => schemasApi.list(productId),
   });
@@ -47,18 +86,87 @@ export default function PdfExtractPage() {
     onSuccess: (data) => {
       setPageImageB64(data.page_image_b64);
       setPageCount(data.page_count);
+      // Reset analyze state when page changes
+      setAnalyzeResult(null);
+      setEditableColumns([]);
     },
     onError: (err) => toast.error(err.message || "Failed to render page"),
   });
 
+  const analyzeMutation = useMutation<PdfAnalyzeResponse, Error, void>({
+    mutationFn: () => pdfApi.analyzeTable(pdfFile!, pageNum, productId),
+    onSuccess: (data) => {
+      setAnalyzeResult(data);
+      setEditableColumns(
+        data.detected_columns.map((col) => ({
+          ...col,
+          key: col.suggested_key,
+          label: col.detected_header,
+          selected: true,
+        }))
+      );
+      if (data.best_match) {
+        setSchemaMode("static");
+        setSchemaId(data.best_match.schema_id);
+        toast.success(
+          `Matched "${data.best_match.schema_name}" — ${Math.round(data.best_match.confidence * 100)}% confidence`
+        );
+      } else {
+        setSchemaMode("dynamic");
+        toast.info(
+          data.detected_columns.length > 0
+            ? `${data.detected_columns.length} columns detected — custom selection active`
+            : "No table detected on this page"
+        );
+      }
+    },
+    onError: (err) => toast.error(err.message || "Table analysis failed"),
+  });
+
   const extractMutation = useMutation<PdfExtractResponse, Error, void>({
-    mutationFn: () =>
-      pdfApi.extractData(pdfFile!, pageNum, schemaId, productId, hint || undefined),
+    mutationFn: () => {
+      if (schemaMode === "dynamic") {
+        const selectedCols: DynamicColumnDef[] = editableColumns
+          .filter((c) => c.selected)
+          .map(({ key, label, data_type }) => ({ key, label, data_type }));
+        return pdfApi.extractData(pdfFile!, pageNum, productId, {
+          dynamicColumns: selectedCols,
+          hint: hint || undefined,
+        });
+      }
+      return pdfApi.extractData(pdfFile!, pageNum, productId, {
+        schemaId,
+        hint: hint || undefined,
+      });
+    },
     onSuccess: (data) => {
       setExtractResult(data);
       toast.success(`Extracted ${data.row_count} rows from page ${pageNum}`);
     },
     onError: (err) => toast.error(err.message || "Extraction failed"),
+  });
+
+  const saveSchemasMutation = useMutation<unknown, Error, void>({
+    mutationFn: () => {
+      const cols = editableColumns.filter((c) => c.selected);
+      return schemasApi.create({
+        product_id: productId,
+        schema_name: saveSchemaName,
+        columns: cols.map(({ key, label, data_type }) => ({
+          key,
+          label,
+          data_type,
+          required: false,
+        })),
+      });
+    },
+    onSuccess: () => {
+      toast.success(`Schema "${saveSchemaName}" saved`);
+      setSaveSchemaName("");
+      setWantsSaveSchema(false);
+      refetchSchemas();
+    },
+    onError: (err) => toast.error(err.message || "Failed to save schema"),
   });
 
   function handleFileSelect(file: File | null) {
@@ -71,7 +179,40 @@ export default function PdfExtractPage() {
     setPageCount(null);
     setExtractResult(null);
     setPageNum(1);
+    setAnalyzeResult(null);
+    setEditableColumns([]);
   }
+
+  function getColumnLabel(key: string): string {
+    if (schemaMode === "dynamic") {
+      return editableColumns.find((ec) => ec.key === key)?.label || key;
+    }
+    const schema = schemas?.find((s) => String(s.id) === schemaId);
+    return schema?.columns?.find((c) => c.key === key)?.label || key;
+  }
+
+  function updateEditableColumn(index: number, field: keyof EditableColumn, value: unknown) {
+    setEditableColumns((prev) =>
+      prev.map((col, i) => (i === index ? { ...col, [field]: value } : col))
+    );
+  }
+
+  function removeEditableColumn(index: number) {
+    setEditableColumns((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function addBlankColumn() {
+    setEditableColumns((prev) => [
+      ...prev,
+      { detected_header: "", suggested_key: "", key: "", label: "", data_type: "string", selected: true },
+    ]);
+  }
+
+  const selectedColCount = editableColumns.filter((c) => c.selected).length;
+  const canExtract =
+    pdfFile &&
+    (schemaMode === "static" ? !!schemaId : selectedColCount > 0) &&
+    !extractMutation.isPending;
 
   const inputStyle = {
     width: "100%",
@@ -222,6 +363,8 @@ export default function PdfExtractPage() {
                       onChange={(e) => {
                         setPageNum(Number(e.target.value));
                         setPageImageB64(null);
+                        setAnalyzeResult(null);
+                        setEditableColumns([]);
                       }}
                       style={{ ...inputStyle, width: 80 }}
                     />
@@ -300,41 +443,349 @@ export default function PdfExtractPage() {
               )}
             </div>
 
-            {/* Step 3 — Config */}
+            {/* Step 3 — Configure Extraction */}
             <div className="card-glass">
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
                 {stepBadge(3)}
                 <h3 style={{ fontSize: 15, fontWeight: 600 }}>Configure Extraction</h3>
               </div>
 
-              <div style={{ marginBottom: 14 }}>
-                <label style={labelStyle}>Target Schema</label>
-                <select
-                  value={schemaId}
-                  onChange={(e) => setSchemaId(e.target.value)}
+              {/* ── Analyze button ── */}
+              <div style={{ marginBottom: 16 }}>
+                <button
+                  onClick={() => analyzeMutation.mutate()}
+                  disabled={!pageImageB64 || analyzeMutation.isPending}
                   style={{
-                    ...inputStyle,
-                    appearance: "auto",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "8px 16px",
+                    borderRadius: 8,
+                    border: `1px solid ${pageImageB64 ? "rgba(96,165,250,0.4)" : "hsl(220 15% 20%)"}`,
+                    background: pageImageB64 ? "rgba(96,165,250,0.08)" : "hsl(220 15% 10%)",
+                    color: pageImageB64 ? BLUE : "hsl(220 10% 35%)",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: !pageImageB64 ? "not-allowed" : "pointer",
+                    opacity: !pageImageB64 ? 0.5 : 1,
+                    transition: "all 0.15s",
                   }}
                 >
-                  <option value="">— select a schema —</option>
-                  {schemas?.map((s) => (
-                    <option key={s.id} value={String(s.id)}>
-                      {s.schema_name}
-                      {s.columns?.length ? ` (${s.columns.length} columns)` : ""}
-                    </option>
-                  ))}
-                </select>
-                {schemas?.length === 0 && (
-                  <p style={{ fontSize: 11, color: "hsl(220 10% 45%)", marginTop: 6 }}>
-                    No schemas found.{" "}
-                    <Link href="/mapping" style={{ color: PURPLE }}>
-                      Create one on the Mapping page.
-                    </Link>
-                  </p>
+                  {analyzeMutation.isPending ? (
+                    <Loader2 size={14} className="spin" />
+                  ) : (
+                    <Search size={14} />
+                  )}
+                  {analyzeMutation.isPending ? "Analyzing table…" : "Analyze Table with AI"}
+                </button>
+
+                {/* Analysis result badge */}
+                {analyzeResult && !analyzeMutation.isPending && (
+                  <div
+                    style={{
+                      marginTop: 8,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 11,
+                        padding: "3px 8px",
+                        borderRadius: 6,
+                        background: "rgba(74,222,128,0.08)",
+                        border: "1px solid rgba(74,222,128,0.2)",
+                        color: GREEN,
+                        fontWeight: 600,
+                      }}
+                    >
+                      {analyzeResult.detected_columns.length} columns detected
+                    </span>
+                    {analyzeResult.best_match && (
+                      <span
+                        style={{
+                          fontSize: 11,
+                          padding: "3px 8px",
+                          borderRadius: 6,
+                          background: "rgba(96,165,250,0.08)",
+                          border: "1px solid rgba(96,165,250,0.2)",
+                          color: BLUE,
+                          fontWeight: 600,
+                        }}
+                      >
+                        Matched &ldquo;{analyzeResult.best_match.schema_name}&rdquo; —{" "}
+                        {Math.round(analyzeResult.best_match.confidence * 100)}%
+                      </span>
+                    )}
+                  </div>
                 )}
               </div>
 
+              {/* ── Mode toggle ── */}
+              <div style={{ marginBottom: 16 }}>
+                <label style={labelStyle}>Schema mode</label>
+                <div
+                  style={{
+                    display: "inline-flex",
+                    borderRadius: 8,
+                    border: "1px solid hsl(220 15% 22%)",
+                    overflow: "hidden",
+                  }}
+                >
+                  {(["static", "dynamic"] as SchemaMode[]).map((mode) => (
+                    <button
+                      key={mode}
+                      onClick={() => setSchemaMode(mode)}
+                      style={{
+                        padding: "7px 16px",
+                        fontSize: 12,
+                        fontWeight: 600,
+                        border: "none",
+                        cursor: "pointer",
+                        transition: "all 0.15s",
+                        background:
+                          schemaMode === mode
+                            ? mode === "static"
+                              ? "rgba(96,165,250,0.15)"
+                              : "rgba(167,139,250,0.15)"
+                            : "hsl(220 15% 10%)",
+                        color:
+                          schemaMode === mode
+                            ? mode === "static"
+                              ? BLUE
+                              : PURPLE
+                            : "hsl(220 10% 45%)",
+                        borderRight: mode === "static" ? "1px solid hsl(220 15% 22%)" : "none",
+                      }}
+                    >
+                      {mode === "static" ? "Use Static Schema" : "Custom Columns"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* ── Static schema section ── */}
+              {schemaMode === "static" && (
+                <div style={{ marginBottom: 14 }}>
+                  <label style={labelStyle}>Target Schema</label>
+                  <select
+                    value={schemaId}
+                    onChange={(e) => setSchemaId(e.target.value)}
+                    style={{ ...inputStyle, appearance: "auto" }}
+                  >
+                    <option value="">— select a schema —</option>
+                    {schemas?.map((s) => (
+                      <option key={s.id} value={String(s.id)}>
+                        {s.schema_name}
+                        {s.columns?.length ? ` (${s.columns.length} columns)` : ""}
+                      </option>
+                    ))}
+                  </select>
+                  {analyzeResult?.best_match && String(analyzeResult.best_match.schema_id) === schemaId && (
+                    <p style={{ fontSize: 11, color: GREEN, marginTop: 6, fontWeight: 600 }}>
+                      Auto-matched — {Math.round(analyzeResult.best_match.confidence * 100)}% confidence
+                    </p>
+                  )}
+                  {schemas?.length === 0 && (
+                    <p style={{ fontSize: 11, color: "hsl(220 10% 45%)", marginTop: 6 }}>
+                      No schemas found.{" "}
+                      <Link href="/mapping" style={{ color: PURPLE }}>
+                        Create one on the Mapping page.
+                      </Link>
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* ── Dynamic column picker ── */}
+              {schemaMode === "dynamic" && (
+                <div style={{ marginBottom: 14 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      marginBottom: 10,
+                    }}
+                  >
+                    <label style={{ ...labelStyle, marginBottom: 0 }}>
+                      Column Selection
+                    </label>
+                    {editableColumns.length > 0 && (
+                      <span
+                        style={{
+                          fontSize: 11,
+                          padding: "2px 8px",
+                          borderRadius: 6,
+                          background: "rgba(167,139,250,0.1)",
+                          border: "1px solid rgba(167,139,250,0.25)",
+                          color: PURPLE,
+                          fontWeight: 600,
+                        }}
+                      >
+                        {selectedColCount} of {editableColumns.length} selected
+                      </span>
+                    )}
+                  </div>
+
+                  {editableColumns.length === 0 ? (
+                    <div
+                      style={{
+                        padding: "16px",
+                        borderRadius: 8,
+                        border: "1px dashed hsl(220 15% 20%)",
+                        color: "hsl(220 10% 40%)",
+                        fontSize: 12,
+                        textAlign: "center",
+                        marginBottom: 10,
+                      }}
+                    >
+                      Click &ldquo;Analyze Table with AI&rdquo; above to detect columns automatically,
+                      or add columns manually below.
+                    </div>
+                  ) : (
+                    <div
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 4,
+                        marginBottom: 10,
+                        maxHeight: 320,
+                        overflowY: "auto",
+                      }}
+                    >
+                      {/* Header row */}
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "28px 1fr 1fr 110px 28px",
+                          gap: 6,
+                          padding: "0 4px 4px",
+                        }}
+                      >
+                        {["", "Key (snake_case)", "Label", "Type", ""].map((h, i) => (
+                          <span key={i} style={{ fontSize: 10, fontWeight: 600, color: "hsl(220 10% 40%)", textTransform: "uppercase", letterSpacing: "0.4px" }}>
+                            {h}
+                          </span>
+                        ))}
+                      </div>
+
+                      {editableColumns.map((col, i) => (
+                        <div
+                          key={i}
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "28px 1fr 1fr 110px 28px",
+                            gap: 6,
+                            alignItems: "center",
+                            padding: "6px 4px",
+                            borderRadius: 6,
+                            background: col.selected ? "hsl(220 15% 11%)" : "hsl(220 15% 9%)",
+                            border: `1px solid ${col.selected ? "hsl(220 15% 20%)" : "hsl(220 15% 14%)"}`,
+                            opacity: col.selected ? 1 : 0.5,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={col.selected}
+                            onChange={(e) => updateEditableColumn(i, "selected", e.target.checked)}
+                            style={{ cursor: "pointer", accentColor: PURPLE, width: 14, height: 14 }}
+                          />
+                          <input
+                            value={col.key}
+                            onChange={(e) => updateEditableColumn(i, "key", e.target.value)}
+                            onBlur={(e) => updateEditableColumn(i, "key", toSnakeCase(e.target.value))}
+                            placeholder="column_key"
+                            style={{
+                              background: "hsl(220 15% 8%)",
+                              border: "1px solid hsl(220 15% 18%)",
+                              borderRadius: 5,
+                              padding: "4px 8px",
+                              fontSize: 12,
+                              fontFamily: "monospace",
+                              color: PURPLE,
+                              outline: "none",
+                              width: "100%",
+                            }}
+                          />
+                          <input
+                            value={col.label}
+                            onChange={(e) => updateEditableColumn(i, "label", e.target.value)}
+                            placeholder="Display Label"
+                            style={{
+                              background: "hsl(220 15% 8%)",
+                              border: "1px solid hsl(220 15% 18%)",
+                              borderRadius: 5,
+                              padding: "4px 8px",
+                              fontSize: 12,
+                              color: "hsl(220 20% 85%)",
+                              outline: "none",
+                              width: "100%",
+                            }}
+                          />
+                          <select
+                            value={col.data_type}
+                            onChange={(e) => updateEditableColumn(i, "data_type", e.target.value)}
+                            style={{
+                              background: "hsl(220 15% 8%)",
+                              border: "1px solid hsl(220 15% 18%)",
+                              borderRadius: 5,
+                              padding: "4px 6px",
+                              fontSize: 11,
+                              color: "hsl(220 10% 60%)",
+                              outline: "none",
+                              width: "100%",
+                              appearance: "auto",
+                            }}
+                          >
+                            {DATA_TYPES.map((t) => (
+                              <option key={t} value={t}>{t}</option>
+                            ))}
+                          </select>
+                          <button
+                            onClick={() => removeEditableColumn(i)}
+                            title="Remove column"
+                            style={{
+                              background: "none",
+                              border: "none",
+                              cursor: "pointer",
+                              color: "hsl(220 10% 35%)",
+                              padding: 2,
+                              display: "flex",
+                              alignItems: "center",
+                            }}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <button
+                    onClick={addBlankColumn}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 5,
+                      padding: "6px 12px",
+                      borderRadius: 7,
+                      border: "1px dashed hsl(220 15% 22%)",
+                      background: "transparent",
+                      color: "hsl(220 10% 50%)",
+                      fontSize: 12,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <Plus size={13} />
+                    Add Column
+                  </button>
+                </div>
+              )}
+
+              {/* ── Extraction hint ── */}
               <div style={{ marginBottom: 18 }}>
                 <label style={labelStyle}>
                   Extraction hint{" "}
@@ -362,7 +813,7 @@ export default function PdfExtractPage() {
               <button
                 className="btn-gradient"
                 onClick={() => extractMutation.mutate()}
-                disabled={!pdfFile || !schemaId || extractMutation.isPending}
+                disabled={!canExtract}
                 style={{
                   width: "100%",
                   padding: "10px 20px",
@@ -428,7 +879,7 @@ export default function PdfExtractPage() {
                       {extractResult.row_count !== 1 ? "s" : ""} extracted
                     </div>
                     <div style={{ fontSize: 11, color: "hsl(220 10% 50%)", marginTop: 2 }}>
-                      From page {pageNum} &rarr; schema &ldquo;{extractResult.schema_name}&rdquo; &mdash;{" "}
+                      From page {pageNum} &rarr; &ldquo;{extractResult.schema_name}&rdquo; &mdash;{" "}
                       <code style={{ fontSize: 11, color: PURPLE }}>{extractResult.table_name}</code>
                     </div>
                   </div>
@@ -441,7 +892,7 @@ export default function PdfExtractPage() {
                       <tr>
                         {extractResult.columns.map((col) => (
                           <th key={col.name}>
-                            {col.name}
+                            {getColumnLabel(col.name)}
                             <span
                               style={{
                                 marginLeft: 5,
@@ -493,6 +944,82 @@ export default function PdfExtractPage() {
                     Showing {extractResult.preview_rows.length} of {extractResult.row_count} rows.
                     Full dataset is saved and queryable in Analytics.
                   </p>
+                )}
+
+                {/* Save dynamic schema */}
+                {extractResult.schema_mode === "dynamic" && (
+                  <div
+                    style={{
+                      padding: "12px 14px",
+                      borderRadius: 8,
+                      background: "hsl(220 15% 10%)",
+                      border: "1px solid hsl(220 15% 18%)",
+                      marginBottom: 16,
+                    }}
+                  >
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        cursor: "pointer",
+                        fontSize: 13,
+                        fontWeight: 600,
+                        color: "hsl(220 20% 80%)",
+                        marginBottom: wantsSaveSchema ? 10 : 0,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={wantsSaveSchema}
+                        onChange={(e) => setWantsSaveSchema(e.target.checked)}
+                        style={{ accentColor: ORANGE, width: 14, height: 14 }}
+                      />
+                      Save these columns as a reusable schema
+                    </label>
+
+                    {wantsSaveSchema && (
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <input
+                          value={saveSchemaName}
+                          onChange={(e) => setSaveSchemaName(e.target.value)}
+                          placeholder="Schema name…"
+                          style={{
+                            ...inputStyle,
+                            flex: 1,
+                            padding: "6px 10px",
+                            fontSize: 12,
+                          }}
+                        />
+                        <button
+                          onClick={() => saveSchemasMutation.mutate()}
+                          disabled={!saveSchemaName.trim() || saveSchemasMutation.isPending}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 5,
+                            padding: "6px 14px",
+                            borderRadius: 7,
+                            border: `1px solid ${ORANGE}44`,
+                            background: `${ORANGE}14`,
+                            color: ORANGE,
+                            fontSize: 12,
+                            fontWeight: 600,
+                            cursor: !saveSchemaName.trim() ? "not-allowed" : "pointer",
+                            opacity: !saveSchemaName.trim() ? 0.5 : 1,
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {saveSchemasMutation.isPending ? (
+                            <Loader2 size={12} className="spin" />
+                          ) : (
+                            <Save size={12} />
+                          )}
+                          Save Schema
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 )}
 
                 <div style={{ display: "flex", gap: 10 }}>
@@ -555,8 +1082,9 @@ export default function PdfExtractPage() {
                 {[
                   { icon: "📄", text: "Upload any PDF — engineering drawings, spec sheets, reports" },
                   { icon: "🔍", text: "Preview the exact page to confirm the table you want" },
-                  { icon: "🎯", text: "Select a static schema that defines your target columns" },
-                  { icon: "✨", text: "Gemini AI extracts all rows and maps them to your schema keys" },
+                  { icon: "🤖", text: "Analyze table — AI detects columns and suggests a matching schema" },
+                  { icon: "🎯", text: "Use a static schema or cherry-pick custom columns" },
+                  { icon: "✨", text: "Gemini extracts all rows and maps them to your chosen keys" },
                   { icon: "💾", text: "Data is saved as a dataset — queryable in Analytics & Compose" },
                 ].map(({ icon, text }, i) => (
                   <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
@@ -567,8 +1095,8 @@ export default function PdfExtractPage() {
               </div>
             </div>
 
-            {/* Selected schema preview */}
-            {schemaId && schemas && (
+            {/* Selected schema preview (static mode) */}
+            {schemaMode === "static" && schemaId && schemas && (
               <div className="card-glass fade-in">
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
                   <div
@@ -665,9 +1193,21 @@ export default function PdfExtractPage() {
                     color: pdfFile ? PURPLE : "hsl(220 10% 40%)",
                   },
                   {
+                    label: "Schema mode",
+                    value: schemaMode === "dynamic"
+                      ? `dynamic (${selectedColCount} cols)`
+                      : "static",
+                    color: schemaMode === "dynamic" ? PURPLE : BLUE,
+                  },
+                  {
                     label: "Schema",
-                    value: schemas?.find((s) => String(s.id) === schemaId)?.schema_name ?? "—",
-                    color: schemaId ? BLUE : "hsl(220 10% 40%)",
+                    value:
+                      schemaMode === "dynamic"
+                        ? selectedColCount > 0
+                          ? `Custom (${selectedColCount} columns)`
+                          : "—"
+                        : schemas?.find((s) => String(s.id) === schemaId)?.schema_name ?? "—",
+                    color: schemaId || selectedColCount > 0 ? BLUE : "hsl(220 10% 40%)",
                   },
                   {
                     label: "Rows extracted",
@@ -691,7 +1231,7 @@ export default function PdfExtractPage() {
                         fontSize: 12,
                         fontWeight: 600,
                         color,
-                        maxWidth: 120,
+                        maxWidth: 140,
                         overflow: "hidden",
                         textOverflow: "ellipsis",
                         whiteSpace: "nowrap",

@@ -341,4 +341,33 @@ export interface PdfExtractResponse {
   columns: { name: string; type: string }[];
   preview_rows: Record<string, unknown>[];
   schema_name: string;
+  schema_mode?: "static" | "dynamic";
+}
+
+// ---- Dynamic Schema Detection ----
+export interface DetectedColumn {
+  detected_header: string;
+  suggested_key: string;
+  data_type: string;
+}
+
+export interface SchemaMatchSuggestion {
+  schema_id: string;
+  schema_name: string;
+  confidence: number;
+  reason: string;
+}
+
+export interface PdfAnalyzeResponse {
+  detected_columns: DetectedColumn[];
+  best_match: SchemaMatchSuggestion | null;
+  confidence_threshold: number;
+}
+
+export interface DynamicColumnDef {
+  key: string;
+  label: string;
+  data_type: string;
+  description?: string;
+  format_hint?: string;
 }
