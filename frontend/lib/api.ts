@@ -2,6 +2,7 @@ import axios from "axios";
 import type {
   TargetSchemaResponse,
   TargetSchemaCreate,
+  TargetSchemaUpdate,
   DatasetMetadata,
   UploadResult,
   LogicalDataset,
@@ -56,10 +57,16 @@ export const schemasApi = {
       .get("/schemas/", { params: productId ? { product_id: productId } : {} })
       .then((r) => r.data),
 
+  getOne: (schemaId: string): Promise<TargetSchemaResponse> =>
+    api.get(`/schemas/${schemaId}`).then((r) => r.data),
+
   create: (data: TargetSchemaCreate): Promise<TargetSchemaResponse> =>
     api.post("/schemas/", data).then((r) => r.data),
 
-  delete: (schemaId: number): Promise<{ message: string }> =>
+  update: (schemaId: string, data: TargetSchemaUpdate): Promise<TargetSchemaResponse> =>
+    api.put(`/schemas/${schemaId}`, data).then((r) => r.data),
+
+  delete: (schemaId: string | number): Promise<{ message: string }> =>
     api.delete(`/schemas/${schemaId}`).then((r) => r.data),
 };
 

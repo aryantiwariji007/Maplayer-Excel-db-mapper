@@ -371,3 +371,9 @@ export interface DynamicColumnDef {
   description?: string;
   format_hint?: string;
 }
+
+export interface TargetSchemaUpdate {
+  schema_name?: string;
+  description?: string;
+  columns?: Omit<TargetColumn, "id" | "schema_id">[];
+}

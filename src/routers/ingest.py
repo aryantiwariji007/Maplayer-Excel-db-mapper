@@ -16,6 +16,7 @@ Endpoints:
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Request
 from pydantic import BaseModel
 from sqlalchemy import select, func, text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 from typing import Optional, Annotated, List
 import uuid
@@ -196,7 +197,49 @@ def perform_mapping(req: MapDatasetRequest, db: Session):
         print(f"DEBUG: Analytics evolution failed or table missing: {e}. Attempting full create.")
         create_analytics_table(engine, ld.table_name, req.column_mapping, source_columns)
     
-    append_to_analytics_table(engine, ld.table_name, dataset.table_name, req.column_mapping, req.dataset_id)
+    # Materialize rows into the analytics table.
+    # If the raw upload table was dropped by lean storage, try to remap from the previously
+    # preserved analytics table using a column bridge (raw_col → old_schema_col → new_schema_col).
+    from sqlalchemy import inspect as sa_inspect
+    if sa_inspect(engine).has_table(dataset.table_name):
+        append_to_analytics_table(engine, ld.table_name, dataset.table_name, req.column_mapping, req.dataset_id)
+    else:
+        source_meta = dataset.column_mapping or {}
+        source_table = source_meta.get("_source_analytics_table")
+        old_mapping = source_meta.get("_old_column_mapping", {})
+
+        if source_table and old_mapping and sa_inspect(engine).has_table(source_table):
+            # Build bridge: old_schema_col → new_schema_col via the shared raw_col key
+            reverse_old = {v: k for k, v in old_mapping.items()}  # old_schema_col -> raw_col
+            bridge = {}
+            for old_col, raw_col in reverse_old.items():
+                if raw_col in req.column_mapping:
+                    bridge[old_col] = req.column_mapping[raw_col]
+
+            if bridge:
+                target_cols = ", ".join(f'"{v}"' for v in bridge.values())
+                source_cols = ", ".join(f'"{k}"::text' for k in bridge.keys())
+                remap_sql = f"""
+                INSERT INTO "{ld.table_name}" (dataset_id, {target_cols})
+                SELECT '{req.dataset_id}', {source_cols}
+                FROM "{source_table}"
+                WHERE dataset_id = '{req.dataset_id}'
+                """
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text(remap_sql))
+                    print(f"DEBUG: Re-materialized {len(bridge)} cols from '{source_table}' → '{ld.table_name}'")
+                except Exception as e:
+                    print(f"DEBUG: Re-materialization bridge failed: {e}")
+            else:
+                print(f"DEBUG: No overlapping columns between old schema and new mapping for dataset '{req.dataset_id}'")
+        else:
+            print(f"DEBUG: Raw table gone and no source analytics data available for '{req.dataset_id}'")
+    # Persist the new mapping and clear any stale source metadata
+    dataset.column_mapping = req.column_mapping
+    dataset.schema_type = "dynamic"
+    dataset.mapped_schema_name = ld.dataset_name
+    db.add(dataset)
     db.commit()
 
     # ── Dispatch Post-Processing Analytics Pipeline ──
@@ -650,39 +693,80 @@ def delete_dataset(dataset_id: str, db: Session = Depends(get_db)):
 
 @router.delete("/datasets/{dataset_id}/mapping")
 def unmap_dataset(dataset_id: str, db: Session = Depends(get_db)):
-    """Remove a dataset's mapping from its logical dataset without deleting the dataset itself.
-    Also clears the dataset's rows from the analytics table."""
+    """Remove a dataset's mapping from its logical/static schema without deleting the dataset itself."""
+    from sqlalchemy import inspect as sa_inspect
+
+    dataset = db.execute(select(Dataset).where(Dataset.id == dataset_id)).scalars().first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    raw_table_exists = sa_inspect(engine).has_table(dataset.table_name)
+    did_unmap = False
+    source_analytics_table = None
+    old_column_mapping_snapshot = {}
+
+    # Case 1: dynamic schema — has a LogicalDatasetMapping record
     mapping = db.execute(
         select(LogicalDatasetMapping).where(LogicalDatasetMapping.dataset_id == dataset_id)
     ).scalars().first()
+    if mapping:
+        ld = db.execute(
+            select(LogicalDataset).where(LogicalDataset.id == mapping.logical_dataset_id)
+        ).scalars().first()
+        if ld:
+            source_analytics_table = ld.table_name
+            old_column_mapping_snapshot = mapping.column_mapping or {}
+            if raw_table_exists:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f'DELETE FROM "{ld.table_name}" WHERE dataset_id = :did'),
+                            {"did": dataset_id}
+                        )
+                except Exception as e:
+                    print(f"DEBUG: Could not remove rows from analytics table: {e}")
+        db.delete(mapping)
+        did_unmap = True
 
-    if not mapping:
+    # Case 2: static schema — no LogicalDatasetMapping, but dataset has schema fields set
+    if dataset.mapped_schema_name and dataset.schema_type == "static":
+        static_schema = db.execute(
+            select(TargetSchema).where(
+                TargetSchema.product_id == dataset.product_id,
+                TargetSchema.schema_name == dataset.mapped_schema_name,
+            )
+        ).scalars().unique().first()
+        if static_schema:
+            static_table = f"mapped_{str(static_schema.id).replace('-', '_')}"
+            source_analytics_table = static_table
+            old_column_mapping_snapshot = dataset.column_mapping or {}
+            if raw_table_exists:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(f'DELETE FROM "{static_table}" WHERE dataset_id = :did'),
+                            {"did": dataset_id}
+                        )
+                except Exception as e:
+                    print(f"DEBUG: Could not remove rows from static analytics table: {e}")
+        did_unmap = True
+
+    if not did_unmap:
         raise HTTPException(status_code=404, detail="No mapping found for this dataset")
 
-    ld = db.execute(
-        select(LogicalDataset).where(LogicalDataset.id == mapping.logical_dataset_id)
-    ).scalars().first()
-
-    # Remove this dataset's rows from the analytics table
-    if ld:
-        try:
-            with engine.begin() as conn:
-                conn.execute(
-                    text(f'DELETE FROM "{ld.table_name}" WHERE dataset_id = :did'),
-                    {"did": dataset_id}
-                )
-        except Exception as e:
-            print(f"DEBUG: Could not remove rows from analytics table: {e}")
-
-    db.delete(mapping)
-
-    # Clear the stored column mapping and schema name on the dataset itself
-    dataset = db.execute(select(Dataset).where(Dataset.id == dataset_id)).scalars().first()
-    if dataset:
+    # When raw table is gone, preserve source info so perform_mapping can re-materialize.
+    # The rows are intentionally NOT deleted from the analytics table in this case.
+    if not raw_table_exists and source_analytics_table:
+        dataset.column_mapping = {
+            "_source_analytics_table": source_analytics_table,
+            "_old_column_mapping": old_column_mapping_snapshot,
+        }
+    else:
         dataset.column_mapping = None
-        dataset.mapped_schema_name = None
-        db.add(dataset)
 
+    dataset.mapped_schema_name = None
+    dataset.schema_type = None
+    db.add(dataset)
     db.commit()
     return {"status": "unmapped", "dataset_id": dataset_id}
 
@@ -1023,15 +1107,80 @@ def preview_dataset_remapped(dataset_id: str, mode: str = "full", db: Session = 
     mapping_rec = db.execute(
         select(LogicalDatasetMapping).where(LogicalDatasetMapping.dataset_id == dataset_id)
     ).scalars().first()
-    
-    raw = query_dataset(engine, f'SELECT * FROM "{dataset.table_name}" LIMIT 200')
-    
+
+    def _serve_from_analytics() -> dict | None:
+        """Fall back to the materialized analytics table when the raw table is unavailable or empty."""
+        internal = {"dataset_id", "_analytics_id"}
+
+        # Only return columns that this dataset actually mapped to — not every column in the shared table
+        raw_col_map = (mapping_rec.column_mapping if mapping_rec else None) or dataset.column_mapping
+        mapped_targets: set | None = (
+            {v for v in raw_col_map.values() if v and v != "- skip -"}
+            if raw_col_map else None
+        )
+
+        def _filter(raw: dict) -> dict:
+            cols = [
+                c for c in raw["columns"]
+                if c not in internal and (mapped_targets is None or c in mapped_targets)
+            ]
+            rows = [
+                {k: v for k, v in row.items() if k not in internal and (mapped_targets is None or k in mapped_targets)}
+                for row in raw["rows"]
+            ]
+            return {"columns": cols, "rows": rows}
+
+        if mapping_rec:
+            ld = db.execute(select(LogicalDataset).where(LogicalDataset.id == mapping_rec.logical_dataset_id)).scalars().first()
+            if ld:
+                try:
+                    analytics_raw = query_dataset(
+                        engine,
+                        f'SELECT * FROM "{ld.table_name}" WHERE dataset_id = \'{dataset_id}\' LIMIT 200'
+                    )
+                    return _filter(analytics_raw)
+                except Exception:
+                    pass
+        elif dataset.schema_type == "static" and dataset.mapped_schema_name:
+            static_schema = db.execute(
+                select(TargetSchema).where(
+                    TargetSchema.product_id == dataset.product_id,
+                    TargetSchema.schema_name == dataset.mapped_schema_name,
+                )
+            ).scalars().unique().first()
+            if static_schema:
+                static_table = f"mapped_{str(static_schema.id).replace('-', '_')}"
+                try:
+                    analytics_raw = query_dataset(
+                        engine,
+                        f'SELECT * FROM "{static_table}" WHERE dataset_id = \'{dataset_id}\' LIMIT 200'
+                    )
+                    return _filter(analytics_raw)
+                except Exception:
+                    pass
+        return None
+
+    # Try to read the raw upload table; fall back to the analytics table if it was dropped or empty
+    try:
+        raw = query_dataset(engine, f'SELECT * FROM "{dataset.table_name}" LIMIT 200')
+        # Raw table exists but is empty — data was materialized; fall through to analytics table
+        if not raw["rows"] and (mapping_rec or dataset.column_mapping):
+            fallback = _serve_from_analytics()
+            if fallback:
+                return sanitize_nans(fallback)
+    except (ProgrammingError, Exception):
+        # Raw table was dropped after materialisation — serve from the analytics table
+        fallback = _serve_from_analytics()
+        if fallback:
+            return sanitize_nans(fallback)
+        return sanitize_nans({"columns": [], "rows": []})
+
     col_map = None
     if mapping_rec:
         col_map = mapping_rec.column_mapping
     elif dataset.column_mapping:
         col_map = dataset.column_mapping
-        
+
     if not col_map:
         return sanitize_nans(raw)
     

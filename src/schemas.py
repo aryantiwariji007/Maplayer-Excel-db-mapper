@@ -85,3 +85,8 @@ class PdfAnalyzeResponse(BaseModel):
     detected_columns: List[DetectedColumn]
     best_match: Optional[SchemaMatchSuggestion] = None
     confidence_threshold: float = 0.7
+
+class TargetSchemaUpdate(BaseModel):
+    schema_name: Optional[str] = None
+    description: Optional[str] = None
+    columns: Optional[List[TargetColumnCreate]] = None

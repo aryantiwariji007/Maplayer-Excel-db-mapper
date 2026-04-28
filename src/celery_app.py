@@ -79,43 +79,84 @@ def process_ingestion_job(self, job_id: str, product_id: str, auto_map: bool, lo
         job.status = "PROCESSING"
         db.commit()
 
-        # Expand files from message data (including ZIP extraction)
+        SUPPORTED_EXTENSIONS = ('.csv', '.xls', '.xlsx', '.xlsm', '.xlsb')
+
+        def _extract_zip_items(zip_bytes: bytes, source_name: str, depth: int = 0) -> list:
+            """Recursively extract spreadsheet/PDF task items from a ZIP, handling nested ZIPs."""
+            if depth > 3:
+                return []
+            result = []
+            try:
+                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+                    for info in z.infolist():
+                        entry_name = info.filename
+                        base_name = entry_name.split("/")[-1]
+                        # Skip macOS metadata, hidden files, and directories
+                        if info.is_dir() or "__MACOSX" in entry_name or base_name.startswith("."):
+                            continue
+                        entry_content = z.read(entry_name)
+                        if not entry_content:
+                            continue
+                        name_lower = base_name.lower()
+                        if name_lower.endswith(".zip"):
+                            # Recurse into nested ZIP
+                            result.extend(_extract_zip_items(entry_content, base_name, depth + 1))
+                        elif name_lower.endswith(".pdf"):
+                            result.append({
+                                "filename": base_name,
+                                "content_b64": base64.b64encode(entry_content).decode("utf-8"),
+                                "is_pdf": True,
+                            })
+                        elif any(name_lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+                            result.extend(_expand_excel_sheets(base_name, entry_content))
+            except Exception as e:
+                print(f"Error extracting zip '{source_name}': {e}")
+                # Surface the error as a failed result so it's visible in the UI
+                result.append({"_zip_error": True, "filename": source_name, "error": str(e)})
+            return result
+
+        # Expand files from message data (including recursive ZIP extraction)
         items = []
+        extraction_errors = []
         for file_data in (files_data or []):
             filename = file_data["filename"]
             content = base64.b64decode(file_data["content_b64"])
 
             if filename.lower().endswith(".zip"):
-                try:
-                    with zipfile.ZipFile(io.BytesIO(content)) as z:
-                        for info in z.infolist():
-                            if info.is_dir() or info.filename.startswith("__MACOSX") or info.filename.split("/")[-1].startswith("."):
-                                continue
-                            if not (info.filename.lower().endswith('.csv') or info.filename.lower().endswith('.xls') or info.filename.lower().endswith('.xlsx') or info.filename.lower().endswith('.xlsm')):
-                                continue
-                            extracted = z.read(info.filename)
-                            if extracted:
-                                base_name = info.filename.split("/")[-1]
-                                items.extend(_expand_excel_sheets(base_name, extracted))
-                except Exception as e:
-                    print(f"Error extracting zip {filename}: {e}")
+                extracted = _extract_zip_items(content, filename)
+                zip_errors = [e for e in extracted if e.get("_zip_error")]
+                extraction_errors.extend(zip_errors)
+                items.extend([e for e in extracted if not e.get("_zip_error")])
+            elif filename.lower().endswith(".pdf"):
+                items.append({
+                    "filename": filename,
+                    "content_b64": file_data["content_b64"],
+                    "is_pdf": True,
+                })
             else:
                 items.extend(_expand_excel_sheets(filename, content))
 
         if not items:
-            job.status = "COMPLETED"
-            job.results = []
+            error_details = "; ".join(e["error"] for e in extraction_errors) if extraction_errors else "No supported files found inside the archive (expected .csv, .xls, .xlsx, .xlsm, .xlsb, .pdf)"
+            job.status = "FAILED"
+            job.error_message = error_details
+            job.results = [{"file_name": e["filename"], "status": "error", "error": e["error"]} for e in extraction_errors] or []
             db.commit()
-            return {"status": "success", "results": []}
+            return {"status": "error", "message": error_details}
 
         # Update total count
         job.total_files = len(items)
         db.commit()
 
         # Dispatch parallel tasks — content travels in the message, no shared filesystem needed
+        pdf_items = [item for item in items if item.get("is_pdf")]
+        data_items = [item for item in items if not item.get("is_pdf")]
         header = [
             process_single_file_task.s(job_id, product_id, auto_map, logical_dataset_name, item)
-            for item in items
+            for item in data_items
+        ] + [
+            process_single_pdf_task.s(job_id, product_id, logical_dataset_name, item)
+            for item in pdf_items
         ]
         callback = finalize_ingestion_job.s(job_id)
 
@@ -163,6 +204,160 @@ def process_single_file_task(job_id: str, product_id: str, auto_map: bool, logic
         db.close()
 
 @app.task
+def process_single_pdf_task(job_id: str, product_id: str, logical_dataset_name: str, task_item: dict):
+    """Worker task: processes all pages of a PDF and creates a Dataset for each page with extractable table data."""
+    import base64, uuid
+    import pandas as pd
+    from sqlalchemy import select
+    db: Session = SessionLocal()
+    from .services.ingestion_service import increment_job_progress
+    from .services.pdf_extractor import get_page_count, render_page_to_base64
+    from .services.gemini import analyze_pdf_table, extract_pdf_table_with_ai
+    from .services.dataset_store import create_dataset_table, insert_dataset_rows
+    from .services.schema_inference import pg_type
+    from .models import Dataset, DatasetColumn, DatasetVersion, TargetSchema
+
+    _DTYPE_ALIAS = {
+        "text": "string", "string": "string", "number": "float", "date": "timestamp",
+        "datetime": "timestamp", "timestamp": "timestamp", "integer": "integer",
+        "float": "float", "boolean": "boolean", "json": "json",
+    }
+
+    filename = task_item.get("filename", "unknown.pdf")
+    try:
+        content = base64.b64decode(task_item["content_b64"])
+
+        try:
+            page_count = get_page_count(content)
+        except Exception as e:
+            increment_job_progress(db, job_id)
+            return [{"file_name": filename, "status": "error", "error": f"Could not read PDF: {e}"}]
+
+        all_schemas = db.execute(
+            select(TargetSchema).where(TargetSchema.product_id == product_id)
+        ).scalars().all()
+        schemas_by_id = {str(s.id): s for s in all_schemas}
+        existing_schemas = [
+            {
+                "id": str(s.id),
+                "name": s.schema_name,
+                "columns": [{"key": col.key, "label": col.label, "data_type": col.data_type} for col in s.columns],
+            }
+            for s in all_schemas
+        ]
+
+        page_results = []
+        for page_num in range(1, page_count + 1):
+            display_name = f"PDF: {filename} (p{page_num})"
+            try:
+                page_image_b64 = render_page_to_base64(content, page_num, dpi=150)
+                analysis = analyze_pdf_table(page_image_b64, existing_schemas)
+                detected_columns = analysis.get("detected_columns") or []
+                best_match = analysis.get("best_match")
+
+                if not detected_columns:
+                    continue  # No table on this page
+
+                # Build schema_columns for extraction
+                if best_match:
+                    matched_schema = schemas_by_id.get(str(best_match["schema_id"]))
+                    if matched_schema and matched_schema.columns:
+                        schema_columns = [
+                            {
+                                "key": col.key, "label": col.label, "data_type": col.data_type,
+                                "description": col.description or "", "required": col.required,
+                                "format_hint": col.format_hint or "", "examples": col.examples or [],
+                            }
+                            for col in matched_schema.columns
+                        ]
+                        mapped_schema_name = matched_schema.schema_name
+                        schema_type_value = "static"
+                    else:
+                        best_match = None
+
+                if not best_match:
+                    schema_columns = [
+                        {
+                            "key": col["suggested_key"], "label": col["detected_header"],
+                            "data_type": col.get("data_type", "string"), "description": "",
+                            "required": False, "format_hint": "", "examples": [],
+                        }
+                        for col in detected_columns
+                    ]
+                    mapped_schema_name = f"Auto ({len(schema_columns)} columns)"
+                    schema_type_value = "dynamic"
+
+                rows = extract_pdf_table_with_ai(page_image_b64, schema_columns, None)
+                if not rows:
+                    continue
+
+                columns_meta = [
+                    {
+                        "column_name": col["key"],
+                        "normalized_name": col["key"],
+                        "data_type": _DTYPE_ALIAS.get(col["data_type"].lower(), "string"),
+                        "pg_type": pg_type(_DTYPE_ALIAS.get(col["data_type"].lower(), "string")),
+                    }
+                    for col in schema_columns
+                ]
+                column_mapping = {col["key"]: col["key"] for col in schema_columns}
+
+                df = pd.DataFrame(rows)
+                for col in columns_meta:
+                    if col["normalized_name"] not in df.columns:
+                        df[col["normalized_name"]] = None
+
+                dataset_id = str(uuid.uuid4())
+                table_name = f"upload_{dataset_id.replace('-', '_')}"
+
+                create_dataset_table(engine, table_name, columns_meta)
+                row_count = insert_dataset_rows(engine, table_name, df, columns_meta)
+
+                dataset = Dataset(
+                    id=dataset_id,
+                    product_id=product_id,
+                    file_name=display_name,
+                    table_name=table_name,
+                    row_count=row_count,
+                    schema_type=schema_type_value,
+                    mapped_schema_name=mapped_schema_name,
+                    column_mapping=column_mapping,
+                )
+                db.add(dataset)
+                for col in columns_meta:
+                    db.add(DatasetColumn(
+                        dataset_id=dataset_id,
+                        column_name=col["column_name"],
+                        normalized_name=col["normalized_name"],
+                        data_type=col["data_type"],
+                    ))
+                db.add(DatasetVersion(dataset_id=dataset_id, version=1, table_name=table_name))
+                db.commit()
+
+                page_results.append({
+                    "file_name": display_name,
+                    "status": "success",
+                    "dataset_id": dataset_id,
+                    "row_count": row_count,
+                    "schema_name": mapped_schema_name,
+                    "schema_type": schema_type_value,
+                })
+            except Exception as e:
+                page_results.append({"file_name": display_name, "status": "error", "error": str(e)})
+
+        increment_job_progress(db, job_id)
+
+        if not page_results:
+            return [{"file_name": filename, "status": "error", "error": "No table data found in any page of this PDF"}]
+        return page_results
+
+    except Exception as e:
+        return [{"file_name": filename, "status": "error", "error": str(e)}]
+    finally:
+        db.close()
+
+
+@app.task
 def finalize_ingestion_job(results, job_id: str):
     """Aggregator task: collects results and finishes the job."""
     db: Session = SessionLocal()
@@ -170,6 +365,15 @@ def finalize_ingestion_job(results, job_id: str):
         job = db.query(UploadJob).filter(UploadJob.id == job_id).first()
         if not job:
             return {"error": "Job not found"}
+
+        # Flatten nested lists returned by process_single_pdf_task (one list per PDF)
+        flat_results = []
+        for r in results:
+            if isinstance(r, list):
+                flat_results.extend(r)
+            else:
+                flat_results.append(r)
+        results = flat_results
 
         job.status = "COMPLETED"
         job.results = sanitize_nans(results)

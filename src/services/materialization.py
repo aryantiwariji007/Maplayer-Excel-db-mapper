@@ -104,3 +104,12 @@ def append_rows(engine: Engine, analytics_table: str, source_table: str, column_
     except Exception as e:
         print(f"ERROR: Materialization failed {source_table} -> {analytics_table}: {e}")
         raise
+
+    # Drop the raw upload table now that data lives in the analytics table
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f'DROP TABLE IF EXISTS "{source_table}"'))
+            conn.commit()
+        print(f"DEBUG: Dropped raw table {source_table}")
+    except Exception as e:
+        print(f"WARN: Could not drop raw table {source_table}: {e}")

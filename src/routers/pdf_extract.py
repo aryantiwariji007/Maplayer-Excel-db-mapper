@@ -265,7 +265,8 @@ async def pdf_extract(
     db.commit()
 
     # ── Build response ────────────────────────────────────────────────────────
-    preview_rows = df.head(20).where(pd.notna(df.head(20)), None).to_dict(orient="records")
+    preview_df = df.head(20).replace([float("inf"), float("-inf")], None)
+    preview_rows = preview_df.where(pd.notna(preview_df), None).to_dict(orient="records")
     columns_out = [{"name": c["normalized_name"], "type": c["data_type"]} for c in columns_meta]
 
     return {

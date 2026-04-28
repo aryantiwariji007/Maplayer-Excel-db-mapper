@@ -217,6 +217,7 @@ def process_single_ingestion_item(
 
                     db_dataset.schema_type = schema_type
                     db_dataset.mapped_schema_name = mapped_schema_name
+                    db_dataset.column_mapping = column_mapping_used
                     db.add(db_dataset)
                     db.commit()
 

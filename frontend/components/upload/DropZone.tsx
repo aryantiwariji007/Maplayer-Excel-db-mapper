@@ -32,7 +32,7 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
       // Filter out hidden files or unsupported extensions that might sneak in via folder drop
       const validFiles = accepted.filter(f =>
         !f.name.startsWith('.') &&
-        (f.name.endsWith('.csv') || f.name.endsWith('.xls') || f.name.endsWith('.xlsx') || f.name.endsWith('.xlsm') || f.name.endsWith('.zip'))
+        (f.name.endsWith('.csv') || f.name.endsWith('.xls') || f.name.endsWith('.xlsx') || f.name.endsWith('.xlsm') || f.name.endsWith('.zip') || f.name.endsWith('.pdf'))
       );
 
       const newFiles = validFiles.map((f) => ({
@@ -55,6 +55,7 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
       "application/vnd.ms-excel.sheet.macroEnabled.12": [".xlsm"],
       "application/zip": [".zip"],
       "application/x-zip-compressed": [".zip"],
+      "application/pdf": [".pdf"],
     },
     multiple: true,
     disabled: uploading,
@@ -96,7 +97,7 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
               {isDragActive ? "Drop files here…" : "Drag & drop files/folders here"}
             </p>
             <p style={{ fontSize: 13, color: "hsl(220 10% 55%)" }}>
-              CSV, XLS, XLSX, XLSM, ZIP supported · Folders OK
+              CSV, XLS, XLSX, XLSM, ZIP, PDF supported · Folders OK
             </p>
           </div>
           <div ref={menuRef} style={{ position: "relative", marginTop: 4 }}>
@@ -129,7 +130,7 @@ export default function DropZone({ onFilesAccepted, uploading }: DropZoneProps) 
                   onMouseEnter={e => (e.currentTarget.style.background = "hsl(220 15% 20%)")}
                   onMouseLeave={e => (e.currentTarget.style.background = "none")}
                 >
-                  <FileUp size={14} color="#a78bfa" /> Files (CSV, XLS, XLSM, ZIP)
+                  <FileUp size={14} color="#a78bfa" /> Files (CSV, XLS, XLSX, ZIP, PDF)
                 </button>
                 <button
                   type="button"

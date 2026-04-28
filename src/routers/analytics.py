@@ -136,12 +136,26 @@ def preview_logical_dataset(logical_dataset_id: str, limit: int = 50, db: Sessio
             "message": "No data mapped yet."
         }
 
+    # Drop columns that are entirely NULL in this preview window — these are
+    # junk columns materialized from identity-mapped files that don't belong
+    # to this logical dataset's schema.
+    rows = result["rows"]
+    if rows:
+        non_null_cols = [
+            col for col in result["columns"]
+            if any(row.get(col) is not None for row in rows)
+        ]
+        non_null_set = set(non_null_cols)
+        rows = [{k: v for k, v in row.items() if k in non_null_set} for row in rows]
+    else:
+        non_null_cols = result["columns"]
+
     return sanitize_nans({
         "logical_dataset": ld.dataset_name,
         "table_name": ld.table_name,
-        "columns": result["columns"],
-        "row_count": len(result["rows"]),
-        "rows": result["rows"],
+        "columns": non_null_cols,
+        "row_count": len(rows),
+        "rows": rows,
     })
 
 

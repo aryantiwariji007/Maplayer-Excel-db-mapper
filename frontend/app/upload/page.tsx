@@ -1,16 +1,18 @@
 "use client";
 import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ingestApi, schemasApi } from "@/lib/api";
+import { ingestApi, pdfApi } from "@/lib/api";
 import { useAppStore } from "@/store/useAppStore";
 import Header from "@/components/layout/Header";
 import DropZone from "@/components/upload/DropZone";
 import UploadResults from "@/components/upload/UploadResults";
-import type { DatasetMetadata } from "@/types";
+import type { DatasetMetadata, PdfAnalyzeResponse } from "@/types";
 import {
   Loader2, Trash2, Database, RefreshCw, Plus, X,
-  Layers, Zap, Lock
+  Layers, Lock, Eye, FileText, ChevronRight, ChevronLeft,
+  Sparkles, Search, Unlink,
 } from "lucide-react";
 
 
@@ -18,23 +20,50 @@ const PURPLE = "#a78bfa";
 const BLUE = "#60a5fa";
 const GREEN = "#4ade80";
 
+function formatRelativeTime(dateStr: string): string {
+  // Append Z if no timezone info so the string is treated as UTC, not local time
+  const normalized =
+    dateStr.endsWith("Z") || dateStr.includes("+") || dateStr.includes("-", 10)
+      ? dateStr
+      : dateStr + "Z";
+  const date = new Date(normalized);
+  const diffMs = Date.now() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1) return "just now";
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+  return `${Math.floor(diffHours / 24)}d ago`;
+}
 
 export default function UploadPage() {
   const { productId } = useAppStore();
   const qc = useQueryClient();
+  const router = useRouter();
 
-  const [files, setFiles] = useState<File[]>([]);
-  const [autoMap, setAutoMap] = useState(true);
-  const [logicalName, setLogicalName] = useState("");
+  const [excelFiles, setExcelFiles] = useState<File[]>([]);
+  const [selectedSchemaId, setSelectedSchemaId] = useState<string>("");
+
+  // PDF extraction state
+  const [pdfFiles, setPdfFiles] = useState<File[]>([]);
+  const [pdfFileIdx, setPdfFileIdx] = useState(0);
+  const [pdfPageNum, setPdfPageNum] = useState(1);
+  const [pdfPageCount, setPdfPageCount] = useState(1);
+  const [pdfPreviewB64, setPdfPreviewB64] = useState<string | null>(null);
+  const [pdfLoadingPreview, setPdfLoadingPreview] = useState(false);
+  const [pdfSchemaId, setPdfSchemaId] = useState("");
+  const [pdfHint, setPdfHint] = useState("");
+  const [pdfAnalysis, setPdfAnalysis] = useState<PdfAnalyzeResponse | null>(null);
+  const [pdfAnalyzing, setPdfAnalyzing] = useState(false);
+  const [pdfExtracting, setPdfExtracting] = useState(false);
   const [results, setResults] = useState<any[]>([]);
   const [jobId, setJobId] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<any>(null);
 
-  // Schema rename modal state
+  // Schema create modal state
   const [schemaModal, setSchemaModal] = useState<{ datasetId: string; defaultName: string } | null>(null);
   const [schemaModalName, setSchemaModalName] = useState("");
   const [schemaModalColumns, setSchemaModalColumns] = useState<{ display: string; key: string }[]>([]);
-  // Set contains normalized_name keys (what the upload table actually uses as column names)
   const [schemaModalSelectedCols, setSchemaModalSelectedCols] = useState<Set<string>>(new Set());
   const [schemaModalColsLoading, setSchemaModalColsLoading] = useState(false);
 
@@ -55,7 +84,7 @@ export default function UploadPage() {
         };
       });
       setSchemaModalColumns(cols);
-      setSchemaModalSelectedCols(new Set(cols.map(c => c.key)));
+      setSchemaModalSelectedCols(new Set(cols.map((c: any) => c.key)));
     } catch {
       // columns stay empty — user can still create schema without column selection
     } finally {
@@ -74,7 +103,6 @@ export default function UploadPage() {
       if (allSelected) {
         await ingestApi.mapDatasetToLogical(datasetId, ld.id, true);
       } else {
-        // Keys are normalized_name — matching what the upload table actually uses as column names
         const colMapping = Object.fromEntries(selectedColumns.map(k => [k, k]));
         await ingestApi.mapDatasetToLogical(datasetId, ld.id, false, colMapping);
       }
@@ -95,7 +123,8 @@ export default function UploadPage() {
   const { data: datasets, isLoading: loadingDatasets, refetch } = useQuery({
     queryKey: ["datasets", productId],
     queryFn: () => ingestApi.listDatasets(productId),
-    enabled: !!productId,
+    enabled: !!productId && !activeJob,
+    refetchOnWindowFocus: false,
   });
 
   const { data: logicalDatasets } = useQuery({
@@ -104,9 +133,9 @@ export default function UploadPage() {
     enabled: !!productId,
   });
 
-  const { data: staticSchemas } = useQuery({
-    queryKey: ["schemas", productId],
-    queryFn: () => schemasApi.list(productId),
+  const { data: allSchemas, isLoading: loadingSchemas } = useQuery({
+    queryKey: ["all-schemas", productId],
+    queryFn: () => ingestApi.listAllSchemas(productId),
     enabled: !!productId,
   });
 
@@ -120,12 +149,12 @@ export default function UploadPage() {
 
   const uploadMutation = useMutation({
     mutationFn: async (filesToUpload: File[]) => {
-      return ingestApi.uploadBulk(filesToUpload, productId, autoMap, logicalName || undefined);
+      return ingestApi.uploadBulk(filesToUpload, productId, true);
     },
     onSuccess: (data) => {
       setJobId(data.job_id);
-      setActiveJob({ status: "PENDING", processed_files: 0, total_files: files.length });
-      setFiles([]);
+      setActiveJob({ status: "PENDING", processed_files: 0, total_files: excelFiles.length });
+      setExcelFiles([]);
     },
     onError: (err: Error) => toast.error(err.message || "Upload failed. Check your API connection."),
   });
@@ -134,17 +163,40 @@ export default function UploadPage() {
     if (jobStatus) {
       setActiveJob(jobStatus);
       if (jobStatus.status === "COMPLETED") {
-          setResults(jobStatus.results || []);
-          toast.success(`Upload complete: ${jobStatus.processed_files} files processed.`);
+        setResults(jobStatus.results || []);
+        toast.success(`Upload complete: ${jobStatus.processed_files} files processed.`);
+        setJobId(null);
+        setActiveJob(null);
+
+        // If a specific schema was selected, remap all successful uploads to it
+        if (selectedSchemaId) {
+          const successfulResults = (jobStatus.results || []).filter(
+            (r: any) => r.status === "success" && r.dataset_id
+          );
+          if (successfulResults.length > 0) {
+            Promise.all(
+              successfulResults.map((r: any) =>
+                ingestApi.mapDatasetToLogical(r.dataset_id, selectedSchemaId, true).catch(() => {})
+              )
+            ).then(() => {
+              qc.invalidateQueries({ queryKey: ["datasets", productId] });
+              qc.invalidateQueries({ queryKey: ["logical-datasets", productId] });
+            });
+          } else {
+            qc.invalidateQueries({ queryKey: ["datasets", productId] });
+            qc.invalidateQueries({ queryKey: ["logical-datasets", productId] });
+          }
+        } else {
           qc.invalidateQueries({ queryKey: ["datasets", productId] });
           qc.invalidateQueries({ queryKey: ["logical-datasets", productId] });
-          setJobId(null); // Stop polling
+        }
       } else if (jobStatus.status === "FAILED") {
-          toast.error(`Background processing failed: ${jobStatus.error}`);
-          setJobId(null);
+        toast.error(`Background processing failed: ${jobStatus.error}`);
+        setJobId(null);
+        setActiveJob(null);
       }
     }
-  }, [jobStatus, productId, qc]);
+  }, [jobStatus, productId, qc, selectedSchemaId]);
 
   const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
@@ -192,11 +244,9 @@ export default function UploadPage() {
     }
   };
 
-
-
   const deleteDynamicSchemaMutation = useMutation({
     mutationFn: (id: string) => ingestApi.deleteLogicalDataset(id),
-    onSuccess: (_, id) => {
+    onSuccess: () => {
       toast.success("Dynamic schema deleted");
       qc.invalidateQueries({ queryKey: ["logical-datasets", productId] });
       qc.invalidateQueries({ queryKey: ["datasets", productId] });
@@ -219,65 +269,358 @@ export default function UploadPage() {
     onError: () => toast.error("Failed to unmap schema"),
   });
 
+  const staticSchemasCount = allSchemas?.filter(s => s.schema_type === "static" || !s.schema_type).length ?? 0;
+
+  /* ── PDF helpers ── */
+  const removePdf = (idx: number) => {
+    setPdfFiles(prev => prev.filter((_, i) => i !== idx));
+    const nextIdx = idx < pdfFileIdx ? pdfFileIdx - 1 : Math.min(pdfFileIdx, pdfFiles.length - 2);
+    setPdfFileIdx(Math.max(0, nextIdx));
+    setPdfPreviewB64(null);
+    setPdfAnalysis(null);
+    setPdfPageNum(1);
+    setPdfPageCount(1);
+  };
+
+  const loadPdfPreview = async (file: File, page: number) => {
+    setPdfLoadingPreview(true);
+    try {
+      const res = await pdfApi.previewPage(file, page);
+      setPdfPreviewB64(res.page_image_b64);
+      setPdfPageCount(res.page_count);
+    } catch (e: any) {
+      toast.error(e.message || "Failed to render PDF page");
+    } finally {
+      setPdfLoadingPreview(false);
+    }
+  };
+
+  const navigatePdfPage = (delta: number) => {
+    const newPage = pdfPageNum + delta;
+    if (newPage < 1 || newPage > pdfPageCount) return;
+    setPdfPageNum(newPage);
+    setPdfPreviewB64(null);
+    setPdfAnalysis(null);
+    loadPdfPreview(pdfFiles[pdfFileIdx], newPage);
+  };
+
+  const runPdfAnalyze = async () => {
+    const file = pdfFiles[pdfFileIdx];
+    if (!file) return;
+    setPdfAnalyzing(true);
+    try {
+      const res = await pdfApi.analyzeTable(file, pdfPageNum, productId);
+      setPdfAnalysis(res);
+      if (res.best_match) {
+        setPdfSchemaId(res.best_match.schema_id);
+        toast.success(`Matched "${res.best_match.schema_name}" — ${Math.round(res.best_match.confidence * 100)}% confidence`);
+      } else {
+        toast.info(`${res.detected_columns?.length ?? 0} columns detected`);
+      }
+    } catch (e: any) {
+      toast.error(e.message || "Analysis failed");
+    } finally {
+      setPdfAnalyzing(false);
+    }
+  };
+
+  const runPdfExtract = async () => {
+    const file = pdfFiles[pdfFileIdx];
+    if (!file) return;
+    setPdfExtracting(true);
+    try {
+      const res = await pdfApi.extractData(file, pdfPageNum, productId, {
+        schemaId: pdfSchemaId || undefined,
+        hint: pdfHint || undefined,
+      });
+      toast.success(`Extracted ${res.row_count} rows from page ${pdfPageNum}`);
+      qc.invalidateQueries({ queryKey: ["datasets", productId] });
+      removePdf(pdfFileIdx);
+    } catch (e: any) {
+      toast.error(e.message || "Extraction failed");
+    } finally {
+      setPdfExtracting(false);
+    }
+  };
+
   return (
     <>
-      <Header title="Upload" subtitle="Ingest CSV and Excel files into MapLayer" />
+      <Header title="Analysis" subtitle="Ingest CSV and Excel files into MapLayer" />
       <div className="page-body">
         <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 24, maxWidth: 1200 }}>
           {/* LEFT — Upload Zone */}
           <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
             <div className="card-glass">
               <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 16 }}>File Ingestion</h3>
-              <DropZone onFilesAccepted={setFiles} uploading={uploadMutation.isPending} />
+              <DropZone
+                onFilesAccepted={(incoming) => {
+                  const pdfs = incoming.filter(f => f.name.toLowerCase().endsWith(".pdf"));
+                  const excels = incoming.filter(f => !f.name.toLowerCase().endsWith(".pdf"));
+                  if (pdfs.length > 0) {
+                    setPdfFiles(prev => [...prev, ...pdfs]);
+                    setPdfPreviewB64(null);
+                    setPdfAnalysis(null);
+                  }
+                  if (excels.length > 0) setExcelFiles(excels);
+                }}
+                uploading={uploadMutation.isPending}
+              />
 
               <div style={{ marginTop: 20, display: "flex", flexWrap: "wrap", gap: 14, alignItems: "flex-end" }}>
-                <div style={{ flex: 1, minWidth: 180 }}>
+                {/* Schema picker dropdown */}
+                <div style={{ flex: 1, minWidth: 200 }}>
                   <label style={{ fontSize: 11, fontWeight: 600, color: "hsl(220 10% 55%)", textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: 6 }}>
-                    Target Schema (optional)
+                    Target Schema
                   </label>
-                  <input
-                    value={logicalName}
-                    onChange={(e) => setLogicalName(e.target.value)}
-                    placeholder="e.g. asset_management"
-                    style={{ width: "100%", background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)", borderRadius: 8, padding: "8px 12px", color: "hsl(220 20% 90%)", fontSize: 13, outline: "none" }}
-                  />
+                  <div style={{ position: "relative" }}>
+                    <select
+                      value={selectedSchemaId}
+                      onChange={(e) => setSelectedSchemaId(e.target.value)}
+                      style={{
+                        width: "100%", background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)",
+                        borderRadius: 8, padding: "8px 32px 8px 12px", color: selectedSchemaId ? "hsl(220 20% 90%)" : "hsl(220 10% 45%)",
+                        fontSize: 13, outline: "none", appearance: "none", cursor: "pointer",
+                      }}
+                    >
+                      <option value="">Auto-detect (AI)</option>
+                      {loadingSchemas ? (
+                        <option disabled>Loading schemas…</option>
+                      ) : (
+                        allSchemas?.map((s) => (
+                          <option key={String(s.id)} value={String(s.id)}>
+                            {s.schema_name}{s.schema_type === "dynamic" ? " (dynamic)" : ""}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                    <ChevronRight size={12} style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%) rotate(90deg)", color: "hsl(220 10% 45%)", pointerEvents: "none" }} />
+                  </div>
                   <p style={{ fontSize: 10, color: "hsl(220 10% 40%)", marginTop: 4 }}>
-                    Leave blank — AI auto-detects the best schema
+                    {selectedSchemaId ? "Files will be mapped to the selected schema after upload" : "AI auto-detects the best matching schema"}
                   </p>
                 </div>
-                <div>
-                  <label style={{ fontSize: 11, fontWeight: 600, color: "hsl(220 10% 55%)", textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: 6 }}>
-                    AI Auto-Map
-                  </label>
-                  <button
-                    onClick={() => setAutoMap(!autoMap)}
-                    style={{
-                      padding: "8px 16px", borderRadius: 8, fontWeight: 600, fontSize: 13,
-                      cursor: "pointer", border: "1px solid",
-                      background: autoMap ? "rgba(167,139,250,0.15)" : "hsl(220 15% 12%)",
-                      borderColor: autoMap ? "rgba(167,139,250,0.4)" : "hsl(220 15% 22%)",
-                      color: autoMap ? "#a78bfa" : "hsl(220 10% 55%)",
-                      display: "flex", alignItems: "center", gap: 6, transition: "all 0.15s",
-                    }}
-                  >
-                    {autoMap ? <Zap size={14} /> : <Zap size={14} style={{ opacity: 0.4 }} />}
-                    {autoMap ? "Enabled" : "Disabled"}
-                  </button>
-                </div>
+
                 <button
                   className="btn-gradient"
-                  onClick={() => files.length > 0 && uploadMutation.mutate(files)}
-                  disabled={files.length === 0 || uploadMutation.isPending}
+                  onClick={() => excelFiles.length > 0 && uploadMutation.mutate(excelFiles)}
+                  disabled={excelFiles.length === 0 || uploadMutation.isPending}
                   style={{ padding: "8px 20px", display: "flex", alignItems: "center", gap: 8, height: 38 }}
                 >
                   {uploadMutation.isPending ? (
                     <><Loader2 size={14} className="spin" /> Uploading…</>
                   ) : (
-                    <>Upload {files.length > 1 ? `${files.length} Files` : "File"}</>
+                    <>Upload {excelFiles.length > 1 ? `${excelFiles.length} Files` : "File"}</>
                   )}
                 </button>
-               </div>
+              </div>
             </div>
+
+            {/* ── Inline PDF Extraction Panel ── */}
+            {pdfFiles.length > 0 && (
+              <div className="card-glass" style={{ border: `1px solid ${PURPLE}33` }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+                  <FileText size={15} color={PURPLE} />
+                  <h3 style={{ fontSize: 14, fontWeight: 700, flex: 1 }}>PDF Extraction</h3>
+                  <span style={{ fontSize: 11, color: "hsl(220 10% 50%)" }}>{pdfFiles.length} file{pdfFiles.length > 1 ? "s" : ""}</span>
+                </div>
+
+                {/* File tabs */}
+                {pdfFiles.length > 1 && (
+                  <div style={{ display: "flex", gap: 4, marginBottom: 14, flexWrap: "wrap" }}>
+                    {pdfFiles.map((f, i) => (
+                      <button
+                        key={i}
+                        onClick={() => { if (i !== pdfFileIdx) { setPdfFileIdx(i); setPdfPageNum(1); setPdfPreviewB64(null); setPdfAnalysis(null); } }}
+                        style={{
+                          display: "flex", alignItems: "center", gap: 5, padding: "4px 10px",
+                          borderRadius: 7, border: "1px solid", fontSize: 11, fontWeight: 600, cursor: "pointer",
+                          background: i === pdfFileIdx ? `${PURPLE}18` : "transparent",
+                          borderColor: i === pdfFileIdx ? `${PURPLE}55` : "hsl(220 15% 22%)",
+                          color: i === pdfFileIdx ? PURPLE : "hsl(220 10% 50%)",
+                        }}
+                      >
+                        {f.name.length > 22 ? f.name.slice(0, 22) + "…" : f.name}
+                        <span
+                          onClick={(e) => { e.stopPropagation(); removePdf(i); }}
+                          style={{ display: "flex", alignItems: "center", cursor: "pointer", opacity: 0.6 }}
+                        >
+                          <X size={10} />
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 20, alignItems: "flex-start", flexWrap: "wrap" }}>
+                  {/* Page Preview */}
+                  <div style={{ flex: "1 1 240px", minWidth: 200 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: "hsl(220 20% 80%)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 200 }}>
+                        {pdfFiles[pdfFileIdx]?.name}
+                      </span>
+                      {pdfFiles.length === 1 && (
+                        <button onClick={() => removePdf(0)} style={{ background: "none", border: "none", cursor: "pointer", color: "hsl(220 10% 45%)", display: "flex", alignItems: "center" }}>
+                          <X size={14} />
+                        </button>
+                      )}
+                    </div>
+
+                    {pdfPreviewB64 ? (
+                      <img
+                        src={`data:image/png;base64,${pdfPreviewB64}`}
+                        alt="PDF page preview"
+                        style={{ width: "100%", borderRadius: 8, border: "1px solid hsl(220 15% 20%)", display: "block" }}
+                      />
+                    ) : (
+                      <div style={{ width: "100%", minHeight: 160, borderRadius: 8, border: "1px dashed hsl(220 15% 22%)", display: "flex", alignItems: "center", justifyContent: "center", background: "hsl(220 15% 8%)" }}>
+                        <button
+                          onClick={() => loadPdfPreview(pdfFiles[pdfFileIdx], pdfPageNum)}
+                          disabled={pdfLoadingPreview}
+                          className="btn-gradient"
+                          style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 16px", fontSize: 12 }}
+                        >
+                          {pdfLoadingPreview ? <><Loader2 size={13} className="spin" /> Loading…</> : <><Eye size={13} /> Preview Page</>}
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Page navigation */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, justifyContent: "center" }}>
+                      <button
+                        onClick={() => navigatePdfPage(-1)}
+                        disabled={pdfPageNum <= 1 || pdfLoadingPreview}
+                        style={{ background: "hsl(220 15% 14%)", border: "1px solid hsl(220 15% 22%)", borderRadius: 6, padding: "4px 10px", cursor: "pointer", color: pdfPageNum <= 1 ? "hsl(220 10% 35%)" : "hsl(220 20% 80%)", fontSize: 13, display: "flex", alignItems: "center" }}
+                      >
+                        <ChevronLeft size={14} />
+                      </button>
+                      <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                        <input
+                          type="number"
+                          min={1}
+                          max={pdfPageCount}
+                          value={pdfPageNum}
+                          onChange={(e) => {
+                            const val = parseInt(e.target.value, 10);
+                            if (!isNaN(val) && val >= 1 && val <= pdfPageCount) setPdfPageNum(val);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              const val = parseInt((e.target as HTMLInputElement).value, 10);
+                              if (!isNaN(val) && val >= 1 && val <= pdfPageCount) {
+                                setPdfPreviewB64(null);
+                                setPdfAnalysis(null);
+                                loadPdfPreview(pdfFiles[pdfFileIdx], val);
+                              }
+                            }
+                          }}
+                          onBlur={(e) => {
+                            const val = parseInt(e.target.value, 10);
+                            if (!isNaN(val) && val >= 1 && val <= pdfPageCount && val !== pdfPageNum) {
+                              setPdfPreviewB64(null);
+                              setPdfAnalysis(null);
+                              loadPdfPreview(pdfFiles[pdfFileIdx], val);
+                            }
+                          }}
+                          disabled={pdfLoadingPreview}
+                          style={{
+                            width: 48, textAlign: "center", background: "hsl(220 15% 12%)",
+                            border: "1px solid hsl(220 15% 25%)", borderRadius: 6,
+                            padding: "3px 6px", color: "hsl(220 20% 88%)", fontSize: 12,
+                            outline: "none", MozAppearance: "textfield",
+                          } as React.CSSProperties}
+                        />
+                        <span style={{ fontSize: 11, color: "hsl(220 10% 45%)" }}>/ {pdfPageCount}</span>
+                      </div>
+                      <button
+                        onClick={() => navigatePdfPage(1)}
+                        disabled={pdfPageNum >= pdfPageCount || pdfLoadingPreview}
+                        style={{ background: "hsl(220 15% 14%)", border: "1px solid hsl(220 15% 22%)", borderRadius: 6, padding: "4px 10px", cursor: "pointer", color: pdfPageNum >= pdfPageCount ? "hsl(220 10% 35%)" : "hsl(220 20% 80%)", fontSize: 13, display: "flex", alignItems: "center" }}
+                      >
+                        <ChevronRight size={14} />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Config + Actions */}
+                  <div style={{ flex: "1 1 200px", minWidth: 200, display: "flex", flexDirection: "column", gap: 14 }}>
+                    {/* Schema picker */}
+                    <div>
+                      <label style={{ fontSize: 11, fontWeight: 600, color: "hsl(220 10% 55%)", textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: 6 }}>
+                        Target Schema
+                      </label>
+                      <div style={{ position: "relative" }}>
+                        <select
+                          value={pdfSchemaId}
+                          onChange={(e) => setPdfSchemaId(e.target.value)}
+                          style={{ width: "100%", background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)", borderRadius: 8, padding: "7px 28px 7px 10px", color: pdfSchemaId ? "hsl(220 20% 90%)" : "hsl(220 10% 45%)", fontSize: 12, outline: "none", appearance: "none", cursor: "pointer" }}
+                        >
+                          <option value="">Auto-detect (AI)</option>
+                          {allSchemas?.map((s) => (
+                            <option key={String(s.id)} value={String(s.id)}>
+                              {s.schema_name}{s.schema_type === "dynamic" ? " (dynamic)" : ""}
+                            </option>
+                          ))}
+                        </select>
+                        <ChevronRight size={11} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%) rotate(90deg)", color: "hsl(220 10% 45%)", pointerEvents: "none" }} />
+                      </div>
+                    </div>
+
+                    {/* Hint */}
+                    <div>
+                      <label style={{ fontSize: 11, fontWeight: 600, color: "hsl(220 10% 55%)", textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: 6 }}>
+                        Hint <span style={{ fontWeight: 400, textTransform: "none" }}>(optional)</span>
+                      </label>
+                      <input
+                        value={pdfHint}
+                        onChange={(e) => setPdfHint(e.target.value)}
+                        placeholder="e.g. Focus on the price table in the middle"
+                        style={{ width: "100%", background: "hsl(220 15% 12%)", border: "1px solid hsl(220 15% 22%)", borderRadius: 8, padding: "7px 10px", color: "hsl(220 20% 90%)", fontSize: 12, outline: "none", boxSizing: "border-box" }}
+                      />
+                    </div>
+
+                    {/* Analyze */}
+                    <button
+                      onClick={runPdfAnalyze}
+                      disabled={!pdfPreviewB64 || pdfAnalyzing}
+                      style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 14px", borderRadius: 8, border: `1px solid ${PURPLE}44`, background: `${PURPLE}10`, color: PURPLE, cursor: (!pdfPreviewB64 || pdfAnalyzing) ? "not-allowed" : "pointer", fontSize: 12, fontWeight: 600, opacity: (!pdfPreviewB64 || pdfAnalyzing) ? 0.5 : 1 }}
+                    >
+                      {pdfAnalyzing ? <><Loader2 size={12} className="spin" /> Analyzing…</> : <><Search size={12} /> Analyze Table</>}
+                    </button>
+
+                    {/* Analysis results */}
+                    {pdfAnalysis && (
+                      <div style={{ padding: "10px 12px", borderRadius: 8, background: "hsl(220 15% 10%)", border: "1px solid hsl(220 15% 18%)" }}>
+                        <p style={{ fontSize: 11, fontWeight: 600, color: "hsl(220 10% 55%)", marginBottom: 6 }}>
+                          <Sparkles size={11} style={{ display: "inline", marginRight: 4 }} />
+                          {pdfAnalysis.detected_columns?.length ?? 0} columns detected
+                          {pdfAnalysis.best_match && ` · matched "${pdfAnalysis.best_match.schema_name}"`}
+                        </p>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                          {(pdfAnalysis.detected_columns ?? []).slice(0, 8).map((col: any, i: number) => (
+                            <span key={i} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 999, background: `${BLUE}15`, border: `1px solid ${BLUE}30`, color: BLUE }}>
+                              {col.detected_header || col.suggested_key}
+                            </span>
+                          ))}
+                          {(pdfAnalysis.detected_columns?.length ?? 0) > 8 && (
+                            <span style={{ fontSize: 10, color: "hsl(220 10% 45%)" }}>+{(pdfAnalysis.detected_columns?.length ?? 0) - 8} more</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Extract & Save */}
+                    <button
+                      className="btn-gradient"
+                      onClick={runPdfExtract}
+                      disabled={pdfExtracting || !pdfPreviewB64}
+                      style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", fontSize: 12, fontWeight: 700, opacity: (pdfExtracting || !pdfPreviewB64) ? 0.5 : 1 }}
+                    >
+                      {pdfExtracting ? <><Loader2 size={13} className="spin" /> Extracting…</> : <><Sparkles size={13} /> Extract & Save</>}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Background Job Progress */}
             {activeJob && (activeJob.status === "PENDING" || activeJob.status === "PROCESSING") && (
@@ -286,7 +629,7 @@ export default function UploadPage() {
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <Loader2 size={16} className="spin" color={PURPLE} />
                     <span style={{ fontWeight: 600, fontSize: 14 }}>
-                        {activeJob.status === "PENDING" ? "Queueing files..." : "AI Processing Data..."}
+                      {activeJob.status === "PENDING" ? "Queueing files..." : "AI Processing Data..."}
                     </span>
                   </div>
                   <div style={{ textAlign: "right" }}>
@@ -296,12 +639,12 @@ export default function UploadPage() {
                   </div>
                 </div>
                 <div style={{ width: "100%", height: 8, background: "hsl(220 15% 15%)", borderRadius: 4, overflow: "hidden" }}>
-                    <div style={{ 
-                        width: `${Math.min(100, (activeJob.processed_files / (activeJob.total_files || 1)) * 100)}%`, 
-                        height: "100%", 
-                        background: `linear-gradient(90deg, ${PURPLE}, ${BLUE})`,
-                        transition: "width 0.5s ease-out" 
-                    }} />
+                  <div style={{
+                    width: `${Math.min(100, (activeJob.processed_files / (activeJob.total_files || 1)) * 100)}%`,
+                    height: "100%",
+                    background: `linear-gradient(90deg, ${PURPLE}, ${BLUE})`,
+                    transition: "width 0.5s ease-out"
+                  }} />
                 </div>
               </div>
             )}
@@ -316,13 +659,27 @@ export default function UploadPage() {
               />
             )}
 
-            {/* Datasets table */}
+            {/* Upload History list */}
             <div className="card-glass">
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: checkedIds.size > 0 ? 10 : 16 }}>
-                <h3 style={{ fontSize: 15, fontWeight: 600 }}>Ingested Datasets</h3>
-                <button onClick={() => refetch()} style={{ background: "none", border: "none", cursor: "pointer", color: "hsl(220 10% 55%)", display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
-                  <RefreshCw size={13} /> Refresh
-                </button>
+                <h3 style={{ fontSize: 15, fontWeight: 600 }}>Upload History</h3>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  {datasets && datasets.length > 0 && (
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12, color: "hsl(220 10% 55%)" }}>
+                      <input
+                        type="checkbox"
+                        checked={allChecked}
+                        ref={(el) => { if (el) el.indeterminate = someChecked; }}
+                        onChange={toggleAll}
+                        style={{ cursor: "pointer", accentColor: "#f87171" }}
+                      />
+                      Select all
+                    </label>
+                  )}
+                  <button onClick={() => refetch()} style={{ background: "none", border: "none", cursor: "pointer", color: "hsl(220 10% 55%)", display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+                    <RefreshCw size={13} /> Refresh
+                  </button>
+                </div>
               </div>
 
               {/* Bulk delete floating bar */}
@@ -332,50 +689,31 @@ export default function UploadPage() {
                   padding: "10px 16px", marginBottom: 16, borderRadius: 12,
                   background: "linear-gradient(135deg, rgba(239,68,68,0.1), rgba(239,68,68,0.05))",
                   border: "1px solid rgba(239,68,68,0.3)",
-                  boxShadow: "0 4px 12px rgba(0,0,0,0.2)",
-                  animation: "fadeIn 0.2s ease-out",
                 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                     <div style={{ width: 32, height: 32, borderRadius: "50%", background: "rgba(239,68,68,0.12)", display: "flex", alignItems: "center", justifyContent: "center" }}>
                       <Trash2 size={16} color="#f87171" />
                     </div>
                     <div>
-                      <span style={{ fontSize: 13, fontWeight: 700, color: "#f87171", display: "block" }}>
-                        Bulk Actions
-                      </span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: "#f87171", display: "block" }}>Bulk Actions</span>
                       <span style={{ fontSize: 11, color: "hsl(220 10% 55%)" }}>
-                        {checkedIds.size} file{checkedIds.size > 1 ? "s" : ""} selected for deletion
+                        {checkedIds.size} file{checkedIds.size > 1 ? "s" : ""} selected
                       </span>
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 8 }}>
                     <button
                       onClick={() => setCheckedIds(new Set())}
-                      style={{
-                        padding: "6px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600,
-                        background: "transparent", border: "1px solid hsl(220 15% 22%)",
-                        cursor: "pointer", color: "hsl(220 10% 60%)",
-                        display: "flex", alignItems: "center", gap: 6,
-                      }}
+                      style={{ padding: "6px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: "transparent", border: "1px solid hsl(220 15% 22%)", cursor: "pointer", color: "hsl(220 10% 60%)", display: "flex", alignItems: "center", gap: 6 }}
                     >
-                      <X size={14} /> Clear Selection
+                      <X size={14} /> Clear
                     </button>
                     <button
                       onClick={handleBulkDelete}
                       disabled={bulkDeleting}
-                      style={{
-                        display: "flex", alignItems: "center", gap: 6, padding: "6px 16px",
-                        borderRadius: 8, border: "none",
-                        background: "#ef4444", color: "white",
-                        cursor: bulkDeleting ? "not-allowed" : "pointer",
-                        fontSize: 12, fontWeight: 700, opacity: bulkDeleting ? 0.6 : 1,
-                        boxShadow: "0 2px 4px rgba(0,0,0,0.2)",
-                      }}
+                      style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 16px", borderRadius: 8, border: "none", background: "#ef4444", color: "white", cursor: bulkDeleting ? "not-allowed" : "pointer", fontSize: 12, fontWeight: 700, opacity: bulkDeleting ? 0.6 : 1 }}
                     >
-                      {bulkDeleting
-                        ? <><Loader2 size={14} className="spin" /> Deleting…</>
-                        : <><Trash2 size={14} /> Delete Selected</>
-                      }
+                      {bulkDeleting ? <><Loader2 size={14} className="spin" /> Deleting…</> : <><Trash2 size={14} /> Delete Selected</>}
                     </button>
                   </div>
                 </div>
@@ -383,104 +721,108 @@ export default function UploadPage() {
 
               {loadingDatasets ? (
                 <div style={{ textAlign: "center", padding: 40, color: "hsl(220 10% 50%)" }}>
-                  <Loader2 size={20} style={{ margin: "0 auto 8px", display: "block" }} /> Loading datasets…
+                  <Loader2 size={20} style={{ margin: "0 auto 8px", display: "block" }} /> Loading history…
                 </div>
               ) : datasets && datasets.length > 0 ? (
-                <div style={{ overflowX: "auto" }}>
-                  <table className="data-table">
-                    <thead>
-                      <tr>
-                        <th style={{ width: 44, paddingRight: 0 }}>
-                          <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {datasets.map((ds: DatasetMetadata & { schema_type?: string }, i) => {
+                    const isChecked = checkedIds.has(ds.id);
+                    const schemaColor = ds.schema_type === "static" ? BLUE : ds.schema_type === "dynamic" ? GREEN : "hsl(220 10% 40%)";
+                    return (
+                      <div
+                        key={ds.id || i}
+                        style={{
+                          padding: "14px 16px", borderRadius: 12, border: "1px solid",
+                          background: isChecked ? "rgba(239,68,68,0.04)" : "hsl(220 15% 10%)",
+                          borderColor: isChecked ? "rgba(239,68,68,0.25)" : "hsl(220 15% 18%)",
+                          transition: "all 0.12s",
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+                          {/* Checkbox */}
+                          <div style={{ paddingTop: 2 }}>
                             <input
                               type="checkbox"
-                              checked={allChecked}
-                              ref={(el) => { if (el) el.indeterminate = someChecked; }}
-                              onChange={toggleAll}
-                              style={{
-                                cursor: "pointer", width: 16, height: 16,
-                                accentColor: "#f87171",
-                              }}
+                              checked={isChecked}
+                              onChange={() => toggleCheck(ds.id)}
+                              style={{ cursor: "pointer", width: 15, height: 15, accentColor: "#f87171" }}
                             />
                           </div>
-                        </th>
-                        <th>Filename</th>
-                        <th>Table</th>
-                        <th>Rows</th>
-                        <th>Columns</th>
-                        <th>Schema Type</th>
-                        <th>Mapped To</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {datasets.map((ds: DatasetMetadata & { schema_type?: string }, i) => {
-                        const isChecked = checkedIds.has(ds.id);
-                        return (
-                          <tr
-                            key={ds.id || i}
-                            style={{ background: isChecked ? "rgba(239,68,68,0.05)" : undefined }}
-                          >
-                            <td style={{ paddingRight: 0 }}>
-                              <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
-                                <input
-                                  type="checkbox"
-                                  checked={isChecked}
-                                  onChange={() => toggleCheck(ds.id)}
-                                  style={{
-                                    cursor: "pointer", width: 16, height: 16,
-                                    accentColor: "#f87171",
-                                  }}
-                                />
-                              </div>
-                            </td>
-                            <td style={{ fontWeight: 500 }}>{ds.original_filename}</td>
-                            <td><code style={{ fontSize: 12, color: PURPLE }}>{ds.table_name}</code></td>
-                            <td>{ds.row_count?.toLocaleString() ?? "—"}</td>
-                            <td>{ds.columns?.length ?? "—"}</td>
-                            <td>
-                              {!ds.schema_type
-                                ? <span style={{ color: "hsl(220 10% 40%)", fontSize: 12 }}>—</span>
-                                : ds.schema_type === "static"
-                                  ? <span style={{ background: "rgba(96,165,250,0.15)", border: "1px solid rgba(96,165,250,0.3)", color: BLUE, fontSize: 11, padding: "2px 8px", borderRadius: 99, fontWeight: 700 }}>🔵 Static</span>
-                                  : <span style={{ background: "rgba(74,222,128,0.1)", border: "1px solid rgba(74,222,128,0.3)", color: GREEN, fontSize: 11, padding: "2px 8px", borderRadius: 99, fontWeight: 700 }}>🟢 Dynamic</span>
-                              }
-                            </td>
-                            <td>
-                              {ds.logical_dataset_name
-                                ? <span style={{ fontSize: 12, fontWeight: 600, color: ds.schema_type === "static" ? BLUE : GREEN }}>{ds.logical_dataset_name}</span>
-                                : <span style={{ color: "hsl(220 10% 45%)", fontSize: 12 }}>—</span>
-                              }
-                            </td>
-                            <td>
-                              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                                {!ds.logical_dataset_name && (
-                                  <button
-                                    onClick={() => openSchemaModal(ds.id, ds.original_filename || "Dataset")}
-                                    style={{ background: "rgba(167,139,250,0.12)", border: "1px solid rgba(167,139,250,0.3)", borderRadius: 6, cursor: "pointer", color: PURPLE, display: "flex", alignItems: "center", gap: 4, fontSize: 11, padding: "3px 8px", fontWeight: 600 }}
-                                  >
-                                    <Plus size={11} /> Schema
-                                  </button>
-                                )}
-                                <button
-                                  onClick={() => deleteMutation.mutate(ds.id)}
-                                  disabled={deleteMutation.isPending || bulkDeleting}
-                                  style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}
-                                >
-                                  <Trash2 size={13} /> Delete
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
+
+                          {/* File icon */}
+                          <div style={{ width: 36, height: 36, borderRadius: 9, background: "hsl(220 15% 14%)", border: "1px solid hsl(220 15% 22%)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                            <FileText size={17} color={PURPLE} />
+                          </div>
+
+                          {/* Info */}
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+                              <span style={{ fontSize: 14, fontWeight: 700, color: "hsl(220 20% 90%)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 280 }}>
+                                {ds.original_filename}
+                              </span>
+                              {ds.logical_dataset_name ? (
+                                <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 999, background: `${schemaColor}22`, border: `1px solid ${schemaColor}44`, color: schemaColor, fontWeight: 600, flexShrink: 0 }}>
+                                  {ds.logical_dataset_name}
+                                </span>
+                              ) : (
+                                <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 999, background: "hsl(220 15% 14%)", border: "1px solid hsl(220 15% 22%)", color: "hsl(220 10% 45%)", flexShrink: 0 }}>
+                                  Unmapped
+                                </span>
+                              )}
+                            </div>
+                            <div style={{ display: "flex", gap: 14, fontSize: 12, color: "hsl(220 10% 50%)" }}>
+                              <span>{ds.row_count?.toLocaleString() ?? 0} rows</span>
+                              <span>{ds.columns?.length ?? 0} cols</span>
+                              {ds.created_at && <span>{formatRelativeTime(ds.created_at)}</span>}
+                            </div>
+                          </div>
+
+                          {/* Actions */}
+                          <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+                            <button
+                              onClick={() => router.push(`/preview?datasetId=${ds.id}`)}
+                              style={{
+                                background: "rgba(96,165,250,0.1)", border: "1px solid rgba(96,165,250,0.3)",
+                                borderRadius: 7, cursor: "pointer", color: BLUE,
+                                display: "flex", alignItems: "center", gap: 5, fontSize: 12, padding: "5px 10px", fontWeight: 600,
+                              }}
+                            >
+                              <Eye size={12} /> View
+                            </button>
+                            {ds.logical_dataset_name ? (
+                              <button
+                                onClick={() => unmapMutation.mutate(ds.id)}
+                                disabled={unmapMutation.isPending}
+                                title="Remove AI-assigned schema so you can assign a new one"
+                                style={{ background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.25)", borderRadius: 7, cursor: "pointer", color: "#f87171", display: "flex", alignItems: "center", gap: 4, fontSize: 11, padding: "5px 9px", fontWeight: 600 }}
+                              >
+                                <Unlink size={11} /> Unmap
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => openSchemaModal(ds.id, ds.original_filename || "Dataset")}
+                                style={{ background: "rgba(167,139,250,0.1)", border: "1px solid rgba(167,139,250,0.25)", borderRadius: 7, cursor: "pointer", color: PURPLE, display: "flex", alignItems: "center", gap: 4, fontSize: 11, padding: "5px 9px", fontWeight: 600 }}
+                              >
+                                <Plus size={11} /> Schema
+                              </button>
+                            )}
+                            <button
+                              onClick={() => deleteMutation.mutate(ds.id)}
+                              disabled={deleteMutation.isPending || bulkDeleting}
+                              style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", display: "flex", alignItems: "center", padding: "5px 6px" }}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               ) : (
                 <div style={{ textAlign: "center", padding: "40px 20px", color: "hsl(220 10% 45%)" }}>
                   <Database size={32} style={{ margin: "0 auto 10px", opacity: 0.4, display: "block" }} />
-                  <p style={{ fontSize: 14 }}>No datasets yet. Upload a file to get started.</p>
+                  <p style={{ fontSize: 14 }}>No history yet. Upload a file to get started.</p>
                 </div>
               )}
             </div>
@@ -497,7 +839,7 @@ export default function UploadPage() {
                 Predefined production contracts. AI prefers these for strict matching.
               </p>
               <p style={{ fontSize: 12, color: "hsl(220 10% 50%)", fontStyle: "italic" }}>
-                Manage static schemas on the Mapping page →
+                Manage schemas on the Profiles page →
               </p>
             </div>
 
@@ -514,7 +856,6 @@ export default function UploadPage() {
                   logicalDatasets.map((ld, i) => (
                     <div
                       key={ld.id || i}
-                      className="dynamic-schema-card"
                       style={{ padding: "10px 12px", background: "hsl(220 15% 10%)", borderRadius: 10, border: "1px solid hsl(220 15% 18%)", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}
                     >
                       <div style={{ flex: 1, minWidth: 0 }}>
@@ -531,20 +872,11 @@ export default function UploadPage() {
                           }
                         }}
                         disabled={deleteDynamicSchemaMutation.isPending}
-                        title="Delete schema"
-                        style={{
-                          flexShrink: 0, background: "none", border: "none",
-                          cursor: "pointer", color: "#f87171", padding: 4,
-                          opacity: 0.45, transition: "opacity 0.15s", borderRadius: 6,
-                          display: "flex", alignItems: "center",
-                        }}
+                        style={{ flexShrink: 0, background: "none", border: "none", cursor: "pointer", color: "#f87171", padding: 4, opacity: 0.45, transition: "opacity 0.15s", borderRadius: 6, display: "flex", alignItems: "center" }}
                         onMouseEnter={(e) => (e.currentTarget.style.opacity = "1")}
                         onMouseLeave={(e) => (e.currentTarget.style.opacity = "0.45")}
                       >
-                        {deleteDynamicSchemaMutation.isPending
-                          ? <Loader2 size={13} className="spin" />
-                          : <Trash2 size={13} />
-                        }
+                        {deleteDynamicSchemaMutation.isPending ? <Loader2 size={13} className="spin" /> : <Trash2 size={13} />}
                       </button>
                     </div>
                   ))
@@ -559,7 +891,7 @@ export default function UploadPage() {
               <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
                 {[
                   { label: "Total files", value: datasets?.length ?? 0, color: PURPLE },
-                  { label: "Static schemas", value: staticSchemas?.length ?? 0, color: BLUE },
+                  { label: "Static schemas", value: staticSchemasCount, color: BLUE },
                   { label: "Dynamic schemas", value: logicalDatasets?.length ?? 0, color: GREEN },
                   { label: "Unmapped files", value: (datasets ?? []).filter((d: any) => !d.logical_dataset_name).length, color: "#f87171" },
                 ].map(({ label, value, color }) => (
@@ -580,19 +912,11 @@ export default function UploadPage() {
 
       {/* Schema create modal */}
       {schemaModal && (
-        <div style={{
-          position: "fixed", inset: 0, zIndex: 200,
-          background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)",
-          display: "flex", alignItems: "center", justifyContent: "center",
-        }}
+        <div style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)", display: "flex", alignItems: "center", justifyContent: "center" }}
           onClick={() => setSchemaModal(null)}
         >
           <div
-            style={{
-              background: "hsl(220 15% 13%)", border: "1px solid hsl(220 15% 25%)",
-              borderRadius: 14, padding: 28, width: 480, boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
-              maxHeight: "90vh", overflowY: "auto",
-            }}
+            style={{ background: "hsl(220 15% 13%)", border: "1px solid hsl(220 15% 25%)", borderRadius: 14, padding: 28, width: 480, boxShadow: "0 20px 60px rgba(0,0,0,0.6)", maxHeight: "90vh", overflowY: "auto" }}
             onClick={e => e.stopPropagation()}
           >
             <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>Create Dynamic Schema</h3>
@@ -609,15 +933,9 @@ export default function UploadPage() {
               onChange={e => setSchemaModalName(e.target.value)}
               onKeyDown={e => { if (e.key === "Escape") setSchemaModal(null); }}
               placeholder="e.g. vendor_quotes"
-              style={{
-                width: "100%", background: "hsl(220 15% 10%)",
-                border: "1px solid hsl(220 15% 25%)", borderRadius: 8,
-                padding: "9px 12px", color: "hsl(220 20% 92%)", fontSize: 13,
-                outline: "none", marginBottom: 18, boxSizing: "border-box",
-              }}
+              style={{ width: "100%", background: "hsl(220 15% 10%)", border: "1px solid hsl(220 15% 25%)", borderRadius: 8, padding: "9px 12px", color: "hsl(220 20% 92%)", fontSize: 13, outline: "none", marginBottom: 18, boxSizing: "border-box" }}
             />
 
-            {/* Column selection */}
             <div style={{ marginBottom: 20 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
                 <label style={{ fontSize: 11, fontWeight: 600, color: "hsl(220 10% 55%)", textTransform: "uppercase", letterSpacing: "0.5px" }}>
@@ -653,11 +971,7 @@ export default function UploadPage() {
                   No column info available — all columns will be included.
                 </p>
               ) : (
-                <div style={{
-                  maxHeight: 220, overflowY: "auto",
-                  background: "hsl(220 15% 10%)", borderRadius: 8,
-                  border: "1px solid hsl(220 15% 20%)", padding: "4px 0",
-                }}>
+                <div style={{ maxHeight: 220, overflowY: "auto", background: "hsl(220 15% 10%)", borderRadius: 8, border: "1px solid hsl(220 15% 20%)", padding: "4px 0" }}>
                   {schemaModalColumns.map(col => {
                     const checked = schemaModalSelectedCols.has(col.key);
                     return (
@@ -668,25 +982,12 @@ export default function UploadPage() {
                           next.has(col.key) ? next.delete(col.key) : next.add(col.key);
                           return next;
                         })}
-                        style={{
-                          display: "flex", alignItems: "center", gap: 10,
-                          padding: "6px 12px", cursor: "pointer",
-                          background: checked ? "rgba(167,139,250,0.06)" : "transparent",
-                          transition: "background 0.1s",
-                        }}
+                        style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 12px", cursor: "pointer", background: checked ? "rgba(167,139,250,0.06)" : "transparent" }}
                       >
-                        <div style={{
-                          width: 14, height: 14, borderRadius: 3, flexShrink: 0,
-                          border: `1.5px solid ${checked ? PURPLE : "hsl(220 15% 30%)"}`,
-                          background: checked ? `${PURPLE}33` : "transparent",
-                          display: "flex", alignItems: "center", justifyContent: "center",
-                        }}>
+                        <div style={{ width: 14, height: 14, borderRadius: 3, flexShrink: 0, border: `1.5px solid ${checked ? PURPLE : "hsl(220 15% 30%)"}`, background: checked ? `${PURPLE}33` : "transparent", display: "flex", alignItems: "center", justifyContent: "center" }}>
                           {checked && <div style={{ width: 8, height: 8, background: PURPLE, borderRadius: 1 }} />}
                         </div>
-                        <span style={{
-                          fontSize: 12, fontFamily: "monospace",
-                          color: checked ? "hsl(220 20% 88%)" : "hsl(220 10% 55%)",
-                        }}>
+                        <span style={{ fontSize: 12, fontFamily: "monospace", color: checked ? "hsl(220 20% 88%)" : "hsl(220 10% 55%)" }}>
                           {col.display}
                         </span>
                       </div>

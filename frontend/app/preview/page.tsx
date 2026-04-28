@@ -1,5 +1,6 @@
 "use client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useSearchParams } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ingestApi, analyticsApi } from "@/lib/api";
 import { useAppStore } from "@/store/useAppStore";
@@ -266,14 +267,23 @@ type ViewMode =
 
 export default function PreviewPage() {
   const { productId } = useAppStore();
+  const searchParams = useSearchParams();
   const [tab, setTab] = useState<"raw" | "logical">("raw");
   const [viewMode, setViewMode] = useState<ViewMode>({ type: "empty" });
+
+  // Pre-select a dataset when navigated from the Upload history
+  useEffect(() => {
+    const datasetId = searchParams.get("datasetId");
+    if (datasetId) {
+      setTab("raw");
+      setViewMode({ type: "raw", datasetId });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // "data" shows the table; "insights" shows the analytics panel (only for unified logical datasets)
   const [viewTab, setViewTab] = useState<"data" | "insights">("data");
   // Tracks which logical dataset folders are open
   const [expandedLogical, setExpandedLogical] = useState<Set<string>>(new Set());
-  // Tracks preview mode for source-files
-  const [sourceMode, setSourceMode] = useState<"full" | "mapped_only">("full");
 
   /* ─── Queries ─── */
   const { data: datasets, isLoading: loadingDatasets } = useQuery({
@@ -288,9 +298,13 @@ export default function PreviewPage() {
     enabled: !!productId,
   });
 
+  const currentRawDataset = viewMode.type === "raw"
+    ? datasets?.find(ds => ds.id === (viewMode as any).datasetId)
+    : null;
+
   const { data: rawPreview, isLoading: loadingRawPreview } = useQuery({
     queryKey: ["preview-raw", viewMode.type === "raw" ? (viewMode as any).datasetId : null],
-    queryFn: () => analyticsApi.previewDataset((viewMode as any).datasetId!),
+    queryFn: () => ingestApi.previewRemapped((viewMode as any).datasetId!, "mapped_only"),
     enabled: viewMode.type === "raw",
   });
 
@@ -301,8 +315,8 @@ export default function PreviewPage() {
   });
 
   const { data: remappedPreview, isLoading: loadingRemapped } = useQuery({
-    queryKey: ["preview-remapped", viewMode.type === "source-file" ? (viewMode as any).datasetId : null, sourceMode],
-    queryFn: () => ingestApi.previewRemapped((viewMode as any).datasetId!, sourceMode),
+    queryKey: ["preview-remapped", viewMode.type === "source-file" ? (viewMode as any).datasetId : null],
+    queryFn: () => ingestApi.previewRemapped((viewMode as any).datasetId!, "mapped_only"),
     enabled: viewMode.type === "source-file",
   });
 
@@ -497,6 +511,17 @@ export default function PreviewPage() {
                     <Sparkles size={10} /> Schema-Mapped · {logicalDatasets?.find(ld => ld.id === (viewMode as any).logicalId)?.dataset_name ?? (viewMode as any).fileName}
                   </span>
                 )}
+                {viewMode.type === "raw" && rawPreview && (
+                  currentRawDataset?.logical_dataset_name ? (
+                    <span style={{ fontSize: 11, padding: "2px 10px", borderRadius: 999, background: "rgba(96,165,250,0.1)", border: "1px solid rgba(96,165,250,0.25)", color: "#93c5fd", display: "flex", alignItems: "center", gap: 4 }}>
+                      <Sparkles size={9} /> {rawPreview.columns?.length ?? 0} mapped columns
+                    </span>
+                  ) : (
+                    <span style={{ fontSize: 11, color: "hsl(220 10% 45%)", fontStyle: "italic" }}>
+                      All original columns — assign a schema to filter
+                    </span>
+                  )
+                )}
               </div>
 
               <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -528,33 +553,6 @@ export default function PreviewPage() {
                   </div>
                 )}
 
-                {/* Full/Mapped toggle for source-file view */}
-                {viewMode.type === "source-file" && (
-                  <div style={{ display: "flex", background: "hsl(220 15% 10%)", borderRadius: 8, padding: 3, border: "1px solid hsl(220 15% 18%)" }}>
-                    <button
-                      onClick={() => setSourceMode("full")}
-                      style={{
-                        padding: "4px 12px", borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none",
-                        background: sourceMode === "full" ? "rgba(96,165,250,0.15)" : "transparent",
-                        color: sourceMode === "full" ? "#93c5fd" : "hsl(220 10% 50%)",
-                        transition: "all 0.15s"
-                      }}
-                    >
-                      Full Dataset
-                    </button>
-                    <button
-                      onClick={() => setSourceMode("mapped_only")}
-                      style={{
-                        padding: "4px 12px", borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none",
-                        background: sourceMode === "mapped_only" ? "rgba(167,139,250,0.15)" : "transparent",
-                        color: sourceMode === "mapped_only" ? "#c4b5fd" : "hsl(220 10% 50%)",
-                        transition: "all 0.15s"
-                      }}
-                    >
-                      Mapped Columns Only
-                    </button>
-                  </div>
-                )}
               </div>
             </div>
 

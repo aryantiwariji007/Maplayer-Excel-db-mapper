@@ -57,7 +57,7 @@ function ResultRow({ r, onCreateSchema, onUnmap }: { r: UploadResult; onCreateSc
                 <span style={{ fontSize: 11, color: "hsl(220 10% 45%)" }}>
                   {Math.round(confidence * 100)}% match
                 </span>
-                {r.schema_type === "dynamic" && onUnmap && (
+                {onUnmap && (
                   <button
                     onClick={() => onUnmap(r)}
                     title="Unmap — remove this schema assignment so you can create a new one"
@@ -157,7 +157,7 @@ export default function UploadResults({ results, onCreateSchema, onUnmap, isPend
               r.status === "success" && !r.auto_mapped && !isPending ? onCreateSchema : undefined
             }
             onUnmap={
-              r.status === "success" && r.auto_mapped && r.schema_type === "dynamic" && !isPending ? onUnmap : undefined
+              r.status === "success" && r.auto_mapped && !isPending ? onUnmap : undefined
             }
           />
         ))}

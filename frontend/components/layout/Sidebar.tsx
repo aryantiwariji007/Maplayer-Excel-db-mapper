@@ -3,19 +3,16 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Upload,
-  GitBranch,
+  BookOpen,
   Eye,
   BarChart3,
   Layers,
-  Zap,
   Link2,
-  FileText,
 } from "lucide-react";
 
 const navItems = [
   { href: "/upload", label: "Upload", icon: Upload, desc: "Ingest files" },
-  { href: "/pdf-extract", label: "PDF Extract", icon: FileText, desc: "Extract from PDF" },
-  { href: "/mapping", label: "Mapping", icon: GitBranch, desc: "Map columns" },
+  { href: "/mapping", label: "Profiles", icon: BookOpen, desc: "Manage schemas" },
   { href: "/preview", label: "Preview", icon: Eye, desc: "Inspect data" },
   { href: "/analytics", label: "Analytics", icon: BarChart3, desc: "Query & metrics" },
   { href: "/compose", label: "Compose", icon: Link2, desc: "Cross-dataset views" },
@@ -54,23 +51,7 @@ export default function Sidebar() {
           </Link>
         ))}
 
-        <div className="nav-label" style={{ marginTop: 16 }}>System</div>
-        <div style={{ padding: "16px 12px", marginTop: "auto" }}>
-          <div style={{
-            background: "linear-gradient(135deg, rgba(167,139,250,0.1) 0%, rgba(96,165,250,0.1) 100%)",
-            border: "1px solid rgba(167,139,250,0.2)",
-            borderRadius: 12,
-            padding: "14px",
-          }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-              <Zap size={14} color="#a78bfa" />
-              <span style={{ fontSize: 12, fontWeight: 600, color: "#a78bfa" }}>AI-Powered</span>
-            </div>
-            <p style={{ fontSize: 11, color: "hsl(220 10% 55%)", lineHeight: 1.5 }}>
-              Auto-maps columns using Gemini AI &amp; semantic similarity.
-            </p>
-          </div>
-        </div>
+
       </nav>
     </aside>
   );
